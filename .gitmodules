@@ -1,0 +1,18 @@
+[submodule "software/riscv-isa-sim"]
+	path = software/riscv-isa-sim
+	url = https://github.com/riscv/riscv-isa-sim.git
+[submodule "software/riscv-tests"]
+	path = software/riscv-tests
+	url = https://github.com/riscv/riscv-tests.git
+[submodule "software/ariane-sdk"]
+	path = software/ariane-sdk
+	url = https://github.com/pulp-platform/ariane-sdk.git
+[submodule "software/riscv-pk"]
+	path = software/riscv-pk
+	url = https://github.com/riscv/riscv-pk.git
+[submodule "software/riscv-opcodes"]
+	path = software/riscv-opcodes
+	url = https://github.com/riscv/riscv-opcodes.git
+[submodule "hardware/cva6"]
+	path = hardware/cva6
+	url = https://github.com/openhwgroup/cva6.git

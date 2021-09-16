@@ -1,0 +1,349 @@
+From 528c3a8b19326e4b043ca4bbf72cf860858a921a Mon Sep 17 00:00:00 2001
+From: Stefan Steinegger <51908919+Steinegger@users.noreply.github.com>
+Date: Wed, 25 Aug 2021 11:21:55 +0200
+Subject: [PATCH] Add SERVAS support
+
+---
+ Makefile       | 16 +++++----
+ encoding.h     | 96 +++++++++++++++++++++++++++++++++++++++++++++++++-
+ opcodes-pseudo |  5 +++
+ opcodes-rv64c  |  5 +++
+ parse_opcodes  | 89 ++++++++++++++++++++++++++++++++++++++++++++--
+ 5 files changed, 201 insertions(+), 10 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index 4d958c2..e73611d 100644
+--- a/Makefile
++++ b/Makefile
+@@ -14,21 +14,25 @@ install: $(ISASIM_H) $(PK_H) $(ENV_H) $(OPENOCD_H) inst.chisel instr-table.tex p
+ 
+ $(ISASIM_H) $(PK_H) $(ENV_H) $(OPENOCD_H): $(ALL_OPCODES) parse_opcodes encoding.h
+ 	cp encoding.h $@
+-	cat $(ALL_OPCODES) | python ./parse_opcodes -c >> $@
++	cat $(ALL_OPCODES) | python3 ./parse_opcodes -c >> $@
+ 
+ inst.chisel: $(ALL_OPCODES) parse_opcodes
+-	cat $(ALL_OPCODES) | ./parse_opcodes -chisel > $@
++	cat $(ALL_OPCODES) | python3 ./parse_opcodes -chisel > $@
+ 
+ inst.go: $(ALL_REAL_ILEN32_OPCODES) parse_opcodes
+-	cat $(ALL_REAL_ILEN32_OPCODES) | ./parse_opcodes -go > $@
++	cat $(ALL_REAL_ILEN32_OPCODES) | python3 ./parse_opcodes -go > $@
+ 
+ inst.sverilog: $(ALL_OPCODES) parse_opcodes
+-	cat $(ALL_OPCODES) | ./parse_opcodes -sverilog > $@
++	cat $(ALL_OPCODES) | python3 ./parse_opcodes -sverilog > $@
+ 
+ instr-table.tex: $(ALL_OPCODES) parse_opcodes
+-	cat $(ALL_OPCODES) | ./parse_opcodes -tex > $@
++	cat $(ALL_OPCODES) | python3 ./parse_opcodes -tex > $@
+ 
+ priv-instr-table.tex: $(ALL_OPCODES) parse_opcodes
+-	cat $(ALL_OPCODES) | ./parse_opcodes -privtex > $@
++	cat $(ALL_OPCODES) | python3 ./parse_opcodes -privtex > $@
+ 
+ .PHONY : install
++
++.PHONY : clean
++clean:
++	rm -rf $(ISASIM_H) $(PK_H) $(ENV_H) $(OPENOCD_H) inst.chisel instr-table.tex priv-instr-table.tex
+diff --git a/encoding.h b/encoding.h
+index b4fbc16..49c9c15 100644
+--- a/encoding.h
++++ b/encoding.h
+@@ -167,7 +167,16 @@
+ #define EXT_IO_BASE        0x40000000
+ #define DRAM_BASE          0x80000000
+ 
++// Z extension Debug register values
++#define Z_DBG_AUTH_WEAK                                   0x1
++#define Z_DBG_ALLOW_UNSAFE_CODE_FETCHES                   0x2
++#define Z_DBG_VSIZE_XRANGE_IS_SIZE_NOT_MASK_NO_ALIGNMENT  0x4
++
+ /* page table entry (PTE) fields */
++/*
++* | XLEN-1   57 | 56  54 | 53  28 | 27  19 | 18  10 | 9             8 | 7 | 6 | 5 | 4 | 3 | 2 | 1 | 0
++* | reserved    | E_PT   | PPN[2]   PPN[1]   PPN[0] | reserved for SW   D   A   G   U   X   W   R   V
++*/
+ #define PTE_V     0x001 /* Valid */
+ #define PTE_R     0x002 /* Read */
+ #define PTE_W     0x004 /* Write */
+@@ -177,11 +186,94 @@
+ #define PTE_A     0x040 /* Accessed */
+ #define PTE_D     0x080 /* Dirty */
+ #define PTE_SOFT  0x300 /* Reserved for Software */
++#define PTE_LSB  (PTE_V | PTE_R | PTE_W | PTE_X | PTE_U | PTE_G | PTE_A | PTE_D | PTE_SOFT) /* Bitmask for bits lower than the PPN */
++
++#define PTE_MSB_SHIFT 54
++#define PTE_MSB (0x3FFULL << PTE_MSB_SHIFT)
++#define PTE_MSB_ENCRYPTED_PAGE  0x1ULL
++#define PTE_MSB_SOFT_SID0       0x2ULL
++#define PTE_MSB_SOFT_SID1       0x4ULL
++#define PTE_MSB_SOFT_SID_MASK (PTE_MSB_SOFT_SID0 | PTE_MSB_SOFT_SID1) //conveniece macro. only used for spike.
++
++// Selects which bits of the LSB are globally used as part of the tweak
++#define E_GLOBAL_PTE_LSB_CONFIG_MASK (PTE_R | PTE_W | PTE_X | PTE_U | PTE_G)
++#define E_GLOBAL_PTE_MSB_CONFIG_MASK (PTE_MSB_SOFT_SID1 | PTE_MSB_SOFT_SID0 | PTE_MSB_ENCRYPTED_PAGE)
++
++#define E_XRANGE_MAP_BITSIZE 3
++#define E_XRANGE_MAP_MASK 0b111ULL
++#define E_XRANGE_MAP_MRANGE_MASK 0b100ULL
++#define E_XRANGE_MAP_SRANGE_MASK 0b010ULL
++#define E_XRANGE_MAP_URANGE_MASK 0b001ULL
++#define E_PRV_LVL_BITSIZE 2
++#define E_PRV_LVL_MASK 0b11ULL
++#define E_LSB_BITSIZE 10
++#define E_LSB_MASK 0x3FFULL
++#define E_MSB_BITSIZE 10
++#define E_MSB_MASK 0x3FFULL
++#define E_TWEAK_ENABLE_BITSIZE 1
++#define E_TWEAK_ENABLE_MASK 0x1ULL
++
++// bitmask for the E_STATUS_register
++#define E_STATUS_ENCLAVE_MODE_EN 0x1
++
++#define CONCAT12(a,b,c,d,e,f,h,i,j,k,l,m) a##b##c##d##e##f##h##i##j##k##l##m
++
++// {L,S}TWEAK :=
++// 50            48| 47       45 | 44           43 | 42      41 | 40            |   39          30   | 29        20 | 19         10 | 9       0 |
++// xrange_map_mask | xrange_map  |   prv_lvl_mask  |   prv_lvl  |  tweak_en     |    pte_msb_mask    |  pte_msb     | pte_lsb_mask  | pte_lsb   |
++
++// xrange_map = concatenation of is_in_mrange | is_in_srange | is_in_urange this selects which of urange/srange/mrange is selected for voffset calculation.
++// prv-lvl = current priviledge mode of the CPU.
++// If tweak_en is set, we are using all overrides from {L,S}TWEAK (depending on their masks)
++// pte_msb = highest 10 bits of PTE.
++// pte_lsb = lowest  10 bits of PTE = [SW D A G U X W R V]. Note that we're only using bits defined in E_GLOBAL_PTE_LSB_CONFIG_MASK
++
++// Values to set as store and load tweaks for the corresponding page type labels, see {L,S}TWEAK for details.
++//                                         xrange_map_mask|xrange_map|prv_lvl_mask|prv_lvl|tweak_en|pte_msb_mask|  pte_msb        |pte_lsb_mask| pte_lsb
++//                                               ___      ,    XXX   ,      __    ,   XX  ,   _    , XXXXXXXXXX , _______  __ , _ , XXXXXXXXXX ,  __________
++//                       x10                     544      ,    444   ,      44    ,   44  ,   4    , 3333333333 , 2222222  22 , 2 , 1111111111 ,  0000000000
++//                        x1                     098      ,    765   ,      43    ,   21  ,   0    , 9876543210 , 9876543  21 , 0 , 9876543210 ,  9876543210
++//masks for the individual lstweak fields:
++#define E_LSTWEAK_XRANGE_MAP_MASK CONCAT12(0b,   111      ,    000   ,      00    ,   00  ,   0    , 0000000000 , 0000000, 00 , 0 , 0000000000 , 0000000000)
++#define E_LSTWEAK_XRANGE_MAP      CONCAT12(0b,   000      ,    111   ,      00    ,   00  ,   0    , 0000000000 , 0000000, 00 , 0 , 0000000000 , 0000000000)
++#define E_LSTWEAK_PRV_LVL_MASK    CONCAT12(0b,   000      ,    000   ,      11    ,   00  ,   0    , 0000000000 , 0000000, 00 , 0 , 0000000000 , 0000000000)
++#define E_LSTWEAK_PRV_LVL         CONCAT12(0b,   000      ,    000   ,      00    ,   11  ,   0    , 0000000000 , 0000000, 00 , 0 , 0000000000 , 0000000000)
++#define E_LSTWEAK_TWEAK_ENABLE    CONCAT12(0b,   000      ,    000   ,      00    ,   00  ,   1    , 0000000000 , 0000000, 00 , 0 , 0000000000 , 0000000000)
++#define E_LSTWEAK_PTE_MSB_MASK    CONCAT12(0b,   000      ,    000   ,      00    ,   00  ,   0    , 1111111111 , 0000000, 00 , 0 , 0000000000 , 0000000000)
++#define E_LSTWEAK_PTE_MSB         CONCAT12(0b,   000      ,    000   ,      00    ,   00  ,   0    , 0000000000 , 1111111, 11 , 1 , 0000000000 , 0000000000)
++#define E_LSTWEAK_PTE_LSB_MASK    CONCAT12(0b,   000      ,    000   ,      00    ,   00  ,   0    , 0000000000 , 0000000, 00 , 0 , 1111111111 , 0000000000)
++#define E_LSTWEAK_PTE_LSB         CONCAT12(0b,   000      ,    000   ,      00    ,   00  ,   0    , 0000000000 , 0000000, 00 , 0 , 0000000000 , 1111111111)
++//predefined tweaks:
++#define E_TWEAK_CLEAR             CONCAT12(0b,   000      ,    000   ,      00    ,   00  ,   0    , 0000000000 , 0000000, 00 , 0 , 0000000000 , 0000000000)
++#define E_TWEAK_MONITOR           CONCAT12(0b,   111      ,    000   ,      11    ,   11  ,   1    , 0000000111 , 0000000, 00 , 1 , 0000000110 , 0000000110)
++#define E_TWEAK_ENCLAVE           CONCAT12(0b,   111      ,    100   ,      11    ,   00  ,   1    , 0000000111 , 0000000, 01 , 1 , 0000000000 , 0000000000)
++#define E_TWEAK_SHCODE            CONCAT12(0b,   111      ,    100   ,      11    ,   00  ,   1    , 0000000111 , 0000000, 10 , 1 , 0000000100 , 0000000000)
++#define E_TWEAK_SHDATA            CONCAT12(0b,   111      ,    001   ,      11    ,   00  ,   1    , 0000000111 , 0000000, 11 , 1 , 0000001000 , 0000000000)
++#define E_TWEAK_UNPROTECTED_U     CONCAT12(0b,   111      ,    000   ,      11    ,   00  ,   1    , 0000000111 , 0000000, 00 , 1 , 1111111111 , 0000000000)
++
++// MSB bits for the PT entries, names are to make the intended page type more obvious in code
++// Make sure to shift left by E_MSB_SHIFT if or-ing
++//NOTE: these have nothing to do with the RSW bits.
++#define E_PT_UNPROTECTED (0)
++#define E_PT_REGULAR     (                    PTE_MSB_SOFT_SID0 | PTE_MSB_ENCRYPTED_PAGE)
++#define E_PT_SHDATA      (PTE_MSB_SOFT_SID1 | PTE_MSB_SOFT_SID0 | PTE_MSB_ENCRYPTED_PAGE)
++#define E_PT_SHCODE      (PTE_MSB_SOFT_SID1 |                     PTE_MSB_ENCRYPTED_PAGE)
++#define E_PT_MONITOR     (                                        PTE_MSB_ENCRYPTED_PAGE)
+ 
+ #define PTE_PPN_SHIFT 10
+-
+ #define PTE_TABLE(PTE) (((PTE) & (PTE_V | PTE_R | PTE_W | PTE_X)) == PTE_V)
+ 
++//for mmap related syscalls
++//shifted by PROT_E_SHIFT to avoid conflicts with pre-existing PROT_* values used in linux (and the proxykernel)
++#define PROT_E_SHIFT       12
++#define PROT_E_MASK        (( PTE_MSB_SOFT_SID_MASK | PTE_MSB_ENCRYPTED_PAGE ) << PROT_E_SHIFT)
++#define PROT_E_MONITOR     (( E_PT_MONITOR                                   ) << PROT_E_SHIFT)
++#define PROT_E_ENCLAVE     (( E_PT_REGULAR                                   ) << PROT_E_SHIFT)
++#define PROT_E_SHCODE      (( E_PT_SHCODE                                    ) << PROT_E_SHIFT)
++#define PROT_E_SHDATA      (( E_PT_SHDATA                                    ) << PROT_E_SHIFT)
++#define PROT_E_UNPROTECTED (( E_PT_UNPROTECTED                               ) << PROT_E_SHIFT)
++
++
+ #ifdef __riscv
+ 
+ #if __riscv_xlen == 64
+@@ -197,6 +289,8 @@
+ #endif
+ #define RISCV_PGSHIFT 12
+ #define RISCV_PGSIZE (1 << RISCV_PGSHIFT)
++//#define RISCV_MSTACKSIZE (1 << (RISCV_PGSHIFT+1))
++#define RISCV_MSTACKSIZE RISCV_PGSIZE
+ 
+ #ifndef __ASSEMBLER__
+ 
+diff --git a/opcodes-pseudo b/opcodes-pseudo
+index 2cd7c91..b52ad6b 100644
+--- a/opcodes-pseudo
++++ b/opcodes-pseudo
+@@ -27,6 +27,11 @@
+ @fmv.x.s   rd rs1 24..20=0 31..27=0x1C 14..12=0 26..25=0 6..2=0x14 1..0=3
+ @fmv.s.x   rd rs1 24..20=0 31..27=0x1E 14..12=0 26..25=0 6..2=0x14 1..0=3
+ 
++
++@fmv.x.q   rd rs1 24..20=0 31..27=0x1C 14..12=0 26..25=3 6..2=0x14 1..0=3
++@fmv.q.x   rd rs1 24..20=0 31..27=0x1E 14..12=0 26..25=3 6..2=0x14 1..0=3
++
+ # specialized fences
+ @fence.tso 31..28=8 27..24=3 23..20=3 19..15=ignore 14..12=0 11..7=ignore 6..2=0x03 1..0=3
+ @pause     31..28=0 27..24=1 23..20=0 19..15=0      14..12=0 11..7=0      6..2=0x03 1..0=3
++
+diff --git a/opcodes-rv64c b/opcodes-rv64c
+index 7efc7c5..b0cd0b9 100644
+--- a/opcodes-rv64c
++++ b/opcodes-rv64c
+@@ -12,3 +12,8 @@ c.addw     1..0=1 15..13=4 12=1      11..10=3 9..7=ignore 6..5=1 4..2=ignore
+ # C2 encoding space
+ @c.ldsp    1..0=2 15..13=3 12=ignore 11..2=ignore # c.flwsp for RV32
+ @c.sdsp    1..0=2 15..13=7 12=ignore 11..2=ignore # c.fswsp for RV32
++
++@c.lq      1..0=0 15..13=1 12=ignore 11..2=ignore # c. for RV32
++@c.sq      1..0=0 15..13=5 12=ignore 11..2=ignore # c. for RV32
++@c.lqsp    1..0=2 15..13=1 12=ignore 11..2=ignore # c. for RV32
++@c.sqsp    1..0=2 15..13=5 12=ignore 11..2=ignore # c. for RV32
+diff --git a/parse_opcodes b/parse_opcodes
+index 4fd7489..dd75ad0 100755
+--- a/parse_opcodes
++++ b/parse_opcodes
+@@ -65,6 +65,7 @@ causes = [
+   (0x0C, 'fetch page fault'),
+   (0x0D, 'load page fault'),
+   (0x0F, 'store page fault'),
++  (0x10, 'decryption_integrity_failure'),
+ ]
+ 
+ csrs = [
+@@ -84,7 +85,7 @@ csrs = [
+   (0x042, 'ucause'),
+   (0x043, 'utval'),
+   (0x044, 'uip'),
+-
++  
+   # Standard User RO
+   (0xC00, 'cycle'),
+   (0xC01, 'time'),
+@@ -162,8 +163,8 @@ csrs = [
+ 
+   # Tentative CSR assignment for CLIC
+   (0x007, 'utvt'),
+-  (0x045, 'unxti'),
+-  (0x046, 'uintstatus'),
++  (50045, 'unxti'),
++  (51046, 'uintstatus'),
+   (0x048, 'uscratchcsw'),
+   (0x049, 'uscratchcswl'),
+   (0x107, 'stvt'),
+@@ -213,6 +214,81 @@ csrs = [
+   (0x3bd, 'pmpaddr13'),
+   (0x3be, 'pmpaddr14'),
+   (0x3bf, 'pmpaddr15'),
++
++  #  Z extension Supervisor R/W
++  (0x5c0, 'E_srange_vbase'),
++  (0x5c1, 'E_srange_vsize'),
++  (0x5c2, 'E_ssid_0'),
++  (0x5c3, 'E_ssid_1'),
++
++  #  Z extension Machine R/W
++  (0x7c0, 'E_mrange_vbase'), 
++  (0x7c1, 'E_mrange_vsize'),
++  (0x7c2, 'E_msid_0'),
++  (0x7c3, 'E_msid_1'),
++  (0x7c5, 'E_ltweak'),
++  (0x7c6, 'E_ltweak_xrange_map'),
++  (0x7c7, 'E_ltweak_xrange_map_mask'),
++  (0x7c8, 'E_ltweak_prv_lvl'),
++  (0x7c9, 'E_ltweak_prv_lvl_mask'),
++  (0x7ca, 'E_ltweak_tweak_en'),
++  (0x7cb, 'E_ltweak_pte_msb'),
++  (0x7cc, 'E_ltweak_pte_msb_mask'),
++  (0x7cd, 'E_ltweak_pte_lsb'),
++  (0x7ce, 'E_ltweak_pte_lsb_mask'),
++  (0x7cf, 'E_stweak'),
++  (0x7d0, 'E_stweak_xrange_map'),
++  (0x7d1, 'E_stweak_xrange_map_mask'),
++  (0x7d2, 'E_stweak_prv_lvl'),
++  (0x7d3, 'E_stweak_prv_lvl_mask'),
++  (0x7d4, 'E_stweak_tweak_en'),
++  (0x7d5, 'E_stweak_pte_msb'),
++  (0x7d6, 'E_stweak_pte_msb_mask'),
++  (0x7d7, 'E_stweak_pte_lsb'),
++  (0x7d8, 'E_stweak_pte_lsb_mask'),
++  (0x7d9, 'E_status'),
++  (0x7da, 'E_secs'),
++  (0x7db, 'E_tcs'),
++
++    # Z extension User R/WE
++  (0x801, 'E_urange_vbase'),
++  (0x802, 'E_urange_vsize'),
++  (0x803, 'E_usid_0'),
++  (0x804, 'E_usid_1'),
++  #  Z extension User R/W for DEBUGGING!
++  (0x823, 'E_dbg_control'),
++  (0x824, 'E_dbg_mrange_vbase'),
++  (0x825, 'E_dbg_mrange_vsize'),
++  (0x826, 'E_dbg_srange_vbase'),
++  (0x827, 'E_dbg_srange_vsize'),
++  (0x828, 'E_dbg_msid_0'),
++  (0x829, 'E_dbg_msid_1'),
++  (0x82A, 'E_dbg_ssid_0'),
++  (0x82B, 'E_dbg_ssid_1'),
++  (0x830, 'E_dbg_ltweak'),
++  (0x831, 'E_dbg_ltweak_xrange_map'),
++  (0x832, 'E_dbg_ltweak_xrange_map_mask'),
++  (0x833, 'E_dbg_ltweak_prv_lvl'),
++  (0x834, 'E_dbg_ltweak_prv_lvl_mask'),
++  (0x835, 'E_dbg_ltweak_tweak_en'),
++  (0x836, 'E_dbg_ltweak_pte_msb'),
++  (0x837, 'E_dbg_ltweak_pte_msb_mask'),
++  (0x838, 'E_dbg_ltweak_pte_lsb'),
++  (0x839, 'E_dbg_ltweak_pte_lsb_mask'),
++  (0x83A, 'E_dbg_stweak'),
++  (0x83B, 'E_dbg_stweak_xrange_map'),
++  (0x83C, 'E_dbg_stweak_xrange_map_mask'),
++  (0x83D, 'E_dbg_stweak_prv_lvl'),
++  (0x83E, 'E_dbg_stweak_prv_lvl_mask'),
++  (0x83F, 'E_dbg_stweak_tweak_en'),
++  (0x840, 'E_dbg_stweak_pte_msb'),
++  (0x841, 'E_dbg_stweak_pte_msb_mask'),
++  (0x842, 'E_dbg_stweak_pte_lsb'),
++  (0x843, 'E_dbg_stweak_pte_lsb_mask'),
++  (0x844, 'E_dbg_status'),
++  (0x845, 'E_dbg_secs'),
++  (0x846, 'E_dbg_tcs'),
++
+   (0x7a0, 'tselect'),
+   (0x7a1, 'tdata1'),
+   (0x7a2, 'tdata2'),
+@@ -281,6 +357,7 @@ csrs = [
+   (0x33D, 'mhpmevent29'),
+   (0x33E, 'mhpmevent30'),
+   (0x33F, 'mhpmevent31'),
++  # TODO add performance coutner for enclave mode and stuff
+ 
+   # Standard Machine RO
+   (0xF11, 'mvendorid'),
+@@ -327,6 +404,9 @@ csrs32 = [
+   (0xC9E, 'hpmcounter30h'),
+   (0xC9F, 'hpmcounter31h'),
+ 
++  # Z extension User R/W
++  (0x080, 'E_sesskeyhh'),
++
+   # Standard Machine RW
+   (0x310, 'mstatush'),
+   (0xB80, 'mcycleh'),
+@@ -360,6 +440,9 @@ csrs32 = [
+   (0xB9D, 'mhpmcounter29h'),
+   (0xB9E, 'mhpmcounter30h'),
+   (0xB9F, 'mhpmcounter31h'),
++
++  # Z extension M R/W
++  (0xBA0, 'E_rtidh'),
+ ]
+ 
+ opcode_base = 0
+-- 
+2.25.1
+

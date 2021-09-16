@@ -1,0 +1,3801 @@
+From f3224a466ba541652a1dce0ccb1982cb86eb4b96 Mon Sep 17 00:00:00 2001
+From: Stefan Steinegger <51908919+Steinegger@users.noreply.github.com>
+Date: Tue, 24 Aug 2021 12:45:08 +0200
+Subject: [PATCH] Add SERVAS support
+
+---
+ Makefile.in            |   2 +-
+ bbl/bbl.lds            |  11 +-
+ config.h.in            |  29 +-
+ machine/api.h          |   5 +
+ machine/atomic.h       |  17 +-
+ machine/crypto_aead.h  |  18 ++
+ machine/decrypt.c      | 108 +++++++
+ machine/emulation.c    |  21 +-
+ machine/encoding.h     | 288 +++++++++++++++++-
+ machine/encrypt.c      |  99 +++++++
+ machine/endian.h       | 128 ++++++++
+ machine/fdt.c          |  12 +-
+ machine/fdt.h          |   6 +-
+ machine/machine.mk.in  |  13 +
+ machine/mentry.S       |  70 +++--
+ machine/minit.c        |   6 +
+ machine/mtrap.c        | 168 ++++++++++-
+ machine/mtrap.h        |  43 ++-
+ machine/permutations.h |  96 ++++++
+ machine/sm.c           | 650 +++++++++++++++++++++++++++++++++++++++++
+ machine/sm.h           | 504 ++++++++++++++++++++++++++++++++
+ machine/sm_api.h       |  76 +++++
+ machine/uart16550.c    |  85 ++----
+ machine/uart16750.c    |  91 ++++++
+ machine/uart16750.h    |  14 +
+ machine/uart_lite.c    |  67 +++++
+ machine/uart_lite.h    |  24 ++
+ machine/vm.h           |   3 +-
+ pk/console.c           |   2 +
+ pk/entry.S             |   4 +
+ pk/mmap.c              |  96 +++++-
+ pk/mmap.h              |   1 +
+ pk/pk.lds              |  11 +-
+ pk/syscall.c           |   9 +
+ pk/syscall.h           |   2 +
+ util/string.c          |  15 +
+ 36 files changed, 2658 insertions(+), 136 deletions(-)
+ create mode 100644 machine/api.h
+ create mode 100644 machine/crypto_aead.h
+ create mode 100644 machine/decrypt.c
+ create mode 100644 machine/encrypt.c
+ create mode 100644 machine/endian.h
+ create mode 100644 machine/permutations.h
+ create mode 100644 machine/sm.c
+ create mode 100644 machine/sm.h
+ create mode 100644 machine/sm_api.h
+ create mode 100644 machine/uart16750.c
+ create mode 100644 machine/uart16750.h
+ create mode 100644 machine/uart_lite.c
+ create mode 100644 machine/uart_lite.h
+
+diff --git a/Makefile.in b/Makefile.in
+index 5c2687d..beca5b4 100644
+--- a/Makefile.in
++++ b/Makefile.in
+@@ -111,7 +111,7 @@ VPATH := $(addprefix $(src_dir)/, $(sprojs_enabled))
+ CC            := @CC@
+ READELF       := @READELF@
+ OBJCOPY       := @OBJCOPY@
+-CFLAGS        := @CFLAGS@ $(CFLAGS) $(march) $(mabi) -DBBL_LOGO_FILE=\"bbl_logo_file\" -DMEM_START=@MEM_START@ -fno-stack-protector -U_FORTIFY_SOURCE
++CFLAGS        := @CFLAGS@ $(CFLAGS) -g $(march) $(mabi) -DBBL_LOGO_FILE=\"bbl_logo_file\" -DMEM_START=@MEM_START@ -fno-stack-protector -U_FORTIFY_SOURCE
+ ifneq (@BBL_PAYLOAD@,no)
+ CFLAGS        := $(CFLAGS) -DBBL_PAYLOAD=\"bbl_payload\"
+ endif
+diff --git a/bbl/bbl.lds b/bbl/bbl.lds
+index 624f691..55873a7 100644
+--- a/bbl/bbl.lds
++++ b/bbl/bbl.lds
+@@ -21,7 +21,7 @@ SECTIONS
+   }
+ 
+   /* text: Program code section */
+-  .text : 
++  .text :
+   {
+     *(.text)
+     *(.text.*)
+@@ -29,7 +29,7 @@ SECTIONS
+   }
+ 
+   /* rodata: Read-only data */
+-  .rodata : 
++  .rodata :
+   {
+     *(.rdata)
+     *(.rodata)
+@@ -60,7 +60,7 @@ SECTIONS
+    _fdata = .;
+ 
+   /* data: Writable data */
+-  .data : 
++  .data :
+   {
+     *(.data)
+     *(.data.*)
+@@ -86,8 +86,9 @@ SECTIONS
+ 
+   /* bss: Uninitialized writeable data section */
+   . = .;
++  . = ALIGN(8);
+   _bss_start = .;
+-  .bss : 
++  .bss :
+   {
+     *(.bss)
+     *(.bss.*)
+@@ -95,6 +96,8 @@ SECTIONS
+     *(.gnu.linkonce.b.*)
+     *(COMMON)
+   }
++  . = ALIGN(8);
++  _bss_end = .;
+ 
+   . = ALIGN(0x1000);
+   _end = .;
+diff --git a/config.h.in b/config.h.in
+index 98763ac..87bd2b8 100644
+--- a/config.h.in
++++ b/config.h.in
+@@ -9,6 +9,32 @@
+ /* Define if subproject MCPPBS_SPROJ_NORM is enabled */
+ #undef DUMMY_PAYLOAD_ENABLED
+ 
++/* Define to 1 if you have the <inttypes.h> header file. */
++#undef HAVE_INTTYPES_H
++
++/* Define to 1 if you have the <stdint.h> header file. */
++#undef HAVE_STDINT_H
++
++/* Always define to 1, for backward compatibility. You can assume <stdlib.h>
++   exists. */
++#undef HAVE_STDLIB_H
++
++/* Define to 1 if you have the <strings.h> header file. */
++#undef HAVE_STRINGS_H
++
++/* Always define to 1, for backward compatibility. You can assume <string.h>
++   exists. */
++#undef HAVE_STRING_H
++
++/* Define to 1 if you have the <sys/stat.h> header file. */
++#undef HAVE_SYS_STAT_H
++
++/* Define to 1 if you have the <sys/types.h> header file. */
++#undef HAVE_SYS_TYPES_H
++
++/* Define to 1 if you have the <unistd.h> header file. */
++#undef HAVE_UNISTD_H
++
+ /* Define if subproject MCPPBS_SPROJ_NORM is enabled */
+ #undef MACHINE_ENABLED
+ 
+@@ -51,7 +77,8 @@
+ /* Define if subproject MCPPBS_SPROJ_NORM is enabled */
+ #undef SOFTFLOAT_ENABLED
+ 
+-/* Define to 1 if you have the ANSI C header files. */
++/* Always define to 1, for backward compatibility. You can assume the C90
++   standard headers exist. */
+ #undef STDC_HEADERS
+ 
+ /* Define if subproject MCPPBS_SPROJ_NORM is enabled */
+diff --git a/machine/api.h b/machine/api.h
+new file mode 100644
+index 0000000..a4aa567
+--- /dev/null
++++ b/machine/api.h
+@@ -0,0 +1,5 @@
++#define CRYPTO_KEYBYTES 16
++#define CRYPTO_NSECBYTES 0
++#define CRYPTO_NPUBBYTES 16
++#define CRYPTO_ABYTES 16
++#define CRYPTO_NOOVERLAP 1
+diff --git a/machine/atomic.h b/machine/atomic.h
+index fe81566..eca7824 100644
+--- a/machine/atomic.h
++++ b/machine/atomic.h
+@@ -17,18 +17,23 @@ typedef struct { int lock; } spinlock_t;
+ #define atomic_set(ptr, val) (*(volatile typeof(*(ptr)) *)(ptr) = val)
+ #define atomic_read(ptr) (*(volatile typeof(*(ptr)) *)(ptr))
+ 
++static spinlock_t atomic_binop_lock = SPINLOCK_INIT;
++
++#define atomic_binop(ptr, inc, op) ({ \
++ long flags = disable_irqsave(); \
++ spinlock_lock(&atomic_binop_lock); \
++ typeof(*(ptr)) res = atomic_read(ptr); \
++ atomic_set(ptr, op); \
++ spinlock_unlock(&atomic_binop_lock); \
++ enable_irqrestore(flags); \
++ res; })
++
+ #ifdef __riscv_atomic
+ # define atomic_add(ptr, inc) __sync_fetch_and_add(ptr, inc)
+ # define atomic_or(ptr, inc) __sync_fetch_and_or(ptr, inc)
+ # define atomic_swap(ptr, swp) __sync_lock_test_and_set(ptr, swp)
+ # define atomic_cas(ptr, cmp, swp) __sync_val_compare_and_swap(ptr, cmp, swp)
+ #else
+-# define atomic_binop(ptr, inc, op) ({ \
+-  long flags = disable_irqsave(); \
+-  typeof(*(ptr)) res = atomic_read(ptr); \
+-  atomic_set(ptr, op); \
+-  enable_irqrestore(flags); \
+-  res; })
+ # define atomic_add(ptr, inc) atomic_binop(ptr, inc, res + (inc))
+ # define atomic_or(ptr, inc) atomic_binop(ptr, inc, res | (inc))
+ # define atomic_swap(ptr, inc) atomic_binop(ptr, inc, (inc))
+diff --git a/machine/crypto_aead.h b/machine/crypto_aead.h
+new file mode 100644
+index 0000000..e2ca9b0
+--- /dev/null
++++ b/machine/crypto_aead.h
+@@ -0,0 +1,18 @@
++
++int crypto_aead_encrypt(
++	unsigned char *c, unsigned long long *clen,
++	const unsigned char *m, unsigned long long mlen,
++	const unsigned char *ad, unsigned long long adlen,
++	const unsigned char *nsec,
++	const unsigned char *npub,
++	const unsigned char *k
++);
++
++int crypto_aead_decrypt(
++	unsigned char *m, unsigned long long *mlen,
++	unsigned char *nsec,
++	const unsigned char *c, unsigned long long clen,
++	const unsigned char *ad, unsigned long long adlen,
++	const unsigned char *npub,
++	const unsigned char *k
++);
+\ No newline at end of file
+diff --git a/machine/decrypt.c b/machine/decrypt.c
+new file mode 100644
+index 0000000..439dcd1
+--- /dev/null
++++ b/machine/decrypt.c
+@@ -0,0 +1,108 @@
++#include "sm.h"
++
++#include "api.h"
++#include "endian.h"
++#include "permutations.h"
++
++#define RATE (128 / 8)
++#define PA_ROUNDS 12
++#define PB_ROUNDS 8
++#define IV                                                        \
++  ((u64)(8 * (CRYPTO_KEYBYTES)) << 56 | (u64)(8 * (RATE)) << 48 | \
++   (u64)(PA_ROUNDS) << 40 | (u64)(PB_ROUNDS) << 32)
++
++int crypto_aead_decrypt(unsigned char* m, unsigned long long* mlen,
++                        unsigned char* nsec, const unsigned char* c,
++                        unsigned long long clen, const unsigned char* ad,
++                        unsigned long long adlen, const unsigned char* npub,
++                        const unsigned char* k) {
++  if (clen < CRYPTO_ABYTES) {
++    *mlen = 0;
++    return -1;
++  }
++  const u64 K0 = LOAD64_KEY(k);
++  const u64 K1 = LOAD64_KEY(k + 8);
++  const u64 N0 = LOAD64_NONCE(npub);
++  const u64 N1 = LOAD64_NONCE(npub + 8);
++  state s;
++  u64 i;
++  (void)nsec;
++
++  /* set plaintext size */
++  *mlen = clen - CRYPTO_ABYTES;
++
++  /* initialization */
++  s.x0 = IV;
++  s.x1 = K0;
++  s.x2 = K1;
++  s.x3 = N0;
++  s.x4 = N1;
++  P12();
++  s.x3 ^= K0;
++  s.x4 ^= K1;
++
++  /* process associated data */
++  if (adlen) {
++    while (adlen >= RATE) {
++      s.x0 ^= LOAD64_AD(ad);
++      s.x1 ^= LOAD64_AD(ad + 8);
++      P8();
++      adlen -= RATE;
++      ad += RATE;
++    }
++    for (i = 0; i < adlen; ++i, ++ad)
++      if (i < 8)
++        s.x0 ^= INS_BYTE64(*ad, i);
++      else
++        s.x1 ^= INS_BYTE64(*ad, i % 8);
++    if (adlen < 8)
++      s.x0 ^= INS_BYTE64(0x80, adlen);
++    else
++      s.x1 ^= INS_BYTE64(0x80, adlen % 8);
++    P8();
++  }
++  s.x4 ^= 1;
++
++  /* process plaintext */
++  clen -= CRYPTO_ABYTES;
++  while (clen >= RATE) {
++    STORE64(m, s.x0 ^ LOAD64(c));
++    STORE64((m + 8), s.x1 ^ LOAD64(c + 8));
++    s.x0 = LOAD64(c);
++    s.x1 = LOAD64(c + 8);
++    P8();
++    clen -= RATE;
++    m += RATE;
++    c += RATE;
++  }
++  for (i = 0; i < clen; ++i, ++m, ++c) {
++    if (i < 8) {
++      *m = EXT_BYTE64(s.x0, i) ^ *c;
++      s.x0 &= ~INS_BYTE64(0xff, i);
++      s.x0 |= INS_BYTE64(*c, i);
++    } else {
++      *m = EXT_BYTE64(s.x1, i % 8) ^ *c;
++      s.x1 &= ~INS_BYTE64(0xff, i % 8);
++      s.x1 |= INS_BYTE64(*c, i % 8);
++    }
++  }
++  if (clen < 8)
++    s.x0 ^= INS_BYTE64(0x80, clen);
++  else
++    s.x1 ^= INS_BYTE64(0x80, clen % 8);
++
++  /* finalization */
++  s.x2 ^= K0;
++  s.x3 ^= K1;
++  P12();
++  s.x3 ^= K0;
++  s.x4 ^= K1;
++
++  /* verify tag (should be constant time, check compiler output) */
++  if (((s.x3 ^ LOAD64(c)) | (s.x4 ^ LOAD64(c + 8))) != 0) {
++    *mlen = 0;
++    return -1;
++  }
++
++  return 0;
++}
+diff --git a/machine/emulation.c b/machine/emulation.c
+index c077a53..634781d 100644
+--- a/machine/emulation.c
++++ b/machine/emulation.c
+@@ -6,6 +6,7 @@
+ #include "unprivileged_memory.h"
+ #include "mtrap.h"
+ #include <limits.h>
++#include "sm.h"
+ 
+ static DECLARE_EMULATION_FUNC(emulate_rvc)
+ {
+@@ -127,7 +128,7 @@ void illegal_insn_trap(uintptr_t* regs, uintptr_t mcause, uintptr_t mepc)
+        "  .word emulate_system_opcode - illegal_insn_trap_table\n"
+        "  .word truly_illegal_insn - illegal_insn_trap_table\n"
+        "  .word truly_illegal_insn - illegal_insn_trap_table\n"
+-       "  .word truly_illegal_insn - illegal_insn_trap_table\n"
++       "  .word sm_trap - illegal_insn_trap_table\n" // entry 31
+        "  .popsection");
+ 
+   uintptr_t mstatus = read_csr(mstatus);
+@@ -284,6 +285,7 @@ DECLARE_EMULATION_FUNC(emulate_system_opcode)
+     case 5: new_csr_val = rs1_num; do_write = 1; break;
+     case 6: new_csr_val = csr_val | rs1_num; break;
+     case 7: new_csr_val = csr_val & ~rs1_num; break;
++    default: new_csr_val = 0; //TODO
+   }
+ 
+   if (do_write && emulate_write_csr(csr_num, new_csr_val, mstatus))
+@@ -291,3 +293,20 @@ DECLARE_EMULATION_FUNC(emulate_system_opcode)
+ 
+   SET_RD(insn, regs, csr_val);
+ }
++
++DECLARE_EMULATION_FUNC(sm_trap)
++{
++  printsm_debug("sm_trap. regs = %x. insn = %x. mcause = %x. mepc = %x. mstatus = %x. \n", 
++    regs, insn, mcause, mepc, mstatus);
++
++
++  printsm_debug("mepc = %x\n", mepc);
++  printsm_debug("mepc = %x\n", CSRR(CSR_MEPC));
++
++  assert(insn == 0xFF);
++  assert(mcause == 2); //cause = invalid instruction
++
++  trap_sm_call(regs, insn, mcause, mepc, mstatus);
++  printsm_debug("sm_trap_ended\n");
++
++}
+diff --git a/machine/encoding.h b/machine/encoding.h
+index 9a49cea..3218230 100644
+--- a/machine/encoding.h
++++ b/machine/encoding.h
+@@ -65,6 +65,7 @@
+ #define DCSR_CAUSE_DEBUGINT 3
+ #define DCSR_CAUSE_STEP     4
+ #define DCSR_CAUSE_HALT     5
++#define DCSR_CAUSE_GROUP    6
+ 
+ #define MCONTROL_TYPE(xlen)    (0xfULL<<((xlen)-4))
+ #define MCONTROL_DMODE(xlen)   (1ULL<<((xlen)-5))
+@@ -166,7 +167,16 @@
+ #define EXT_IO_BASE        0x40000000
+ #define DRAM_BASE          0x80000000
+ 
++// Z extension Debug register values
++#define Z_DBG_AUTH_WEAK                                   0x1
++#define Z_DBG_ALLOW_UNSAFE_CODE_FETCHES                   0x2
++#define Z_DBG_VSIZE_XRANGE_IS_SIZE_NOT_MASK_NO_ALIGNMENT  0x4
++
+ /* page table entry (PTE) fields */
++/*
++* | XLEN-1   57 | 56  54 | 53  28 | 27  19 | 18  10 | 9             8 | 7 | 6 | 5 | 4 | 3 | 2 | 1 | 0
++* | reserved    | E_PT   | PPN[2]   PPN[1]   PPN[0] | reserved for SW   D   A   G   U   X   W   R   V
++*/
+ #define PTE_V     0x001 /* Valid */
+ #define PTE_R     0x002 /* Read */
+ #define PTE_W     0x004 /* Write */
+@@ -176,11 +186,94 @@
+ #define PTE_A     0x040 /* Accessed */
+ #define PTE_D     0x080 /* Dirty */
+ #define PTE_SOFT  0x300 /* Reserved for Software */
++#define PTE_LSB  (PTE_V | PTE_R | PTE_W | PTE_X | PTE_U | PTE_G | PTE_A | PTE_D | PTE_SOFT) /* Bitmask for bits lower than the PPN */
+ 
+-#define PTE_PPN_SHIFT 10
++#define PTE_MSB_SHIFT 54
++#define PTE_MSB (0x3FFULL << PTE_MSB_SHIFT)
++#define PTE_MSB_ENCRYPTED_PAGE  0x1ULL
++#define PTE_MSB_SOFT_SID0       0x2ULL
++#define PTE_MSB_SOFT_SID1       0x4ULL
++#define PTE_MSB_SOFT_SID_MASK (PTE_MSB_SOFT_SID0 | PTE_MSB_SOFT_SID1) //conveniece macro. only used for spike.
++
++// Selects which bits of the LSB are globally used as part of the tweak
++#define E_GLOBAL_PTE_LSB_CONFIG_MASK (PTE_R | PTE_W | PTE_X | PTE_U | PTE_G)
++#define E_GLOBAL_PTE_MSB_CONFIG_MASK (PTE_MSB_SOFT_SID1 | PTE_MSB_SOFT_SID0 | PTE_MSB_ENCRYPTED_PAGE) //TODO maybe (PTE_MSB >> PTE_MSB_SHIFT)
++
++#define E_XRANGE_MAP_BITSIZE 3
++#define E_XRANGE_MAP_MASK 0b111ULL
++#define E_XRANGE_MAP_MRANGE_MASK 0b100ULL
++#define E_XRANGE_MAP_SRANGE_MASK 0b010ULL
++#define E_XRANGE_MAP_URANGE_MASK 0b001ULL
++#define E_PRV_LVL_BITSIZE 2
++#define E_PRV_LVL_MASK 0b11ULL
++#define E_LSB_BITSIZE 10
++#define E_LSB_MASK 0x3FFULL
++#define E_MSB_BITSIZE 10
++#define E_MSB_MASK 0x3FFULL
++#define E_TWEAK_ENABLE_BITSIZE 1
++#define E_TWEAK_ENABLE_MASK 0x1ULL
++
++// bitmask for the E_STATUS_register
++#define E_STATUS_ENCLAVE_MODE_EN 0x1
++
++#define CONCAT12(a,b,c,d,e,f,h,i,j,k,l,m) a##b##c##d##e##f##h##i##j##k##l##m
++
++// {L,S}TWEAK :=
++// 50            48| 47       45 | 44           43 | 42      41 | 40            |   39          30   | 29        20 | 19         10 | 9       0 |
++// xrange_map_mask | xrange_map  |   prv_lvl_mask  |   prv_lvl  |  tweak_en     |    pte_msb_mask    |  pte_msb     | pte_lsb_mask  | pte_lsb   |
+ 
++// xrange_map = concatenation of is_in_mrange | is_in_srange | is_in_urange this selects which of urange/srange/mrange is selected for voffset calculation.
++// prv-lvl = current priviledge mode of the CPU.
++// If tweak_en is set, we are using all overrides from {L,S}TWEAK (depending on their masks)
++// pte_msb = highest 10 bits of PTE.
++// pte_lsb = lowest  10 bits of PTE = [SW D A G U X W R V]. Note that we're only using bits defined in E_GLOBAL_PTE_LSB_CONFIG_MASK
++
++// Values to set as store and load tweaks for the corresponding page type labels, see {L,S}TWEAK for details.
++//                                         xrange_map_mask|xrange_map|prv_lvl_mask|prv_lvl|tweak_en|pte_msb_mask|  pte_msb        |pte_lsb_mask| pte_lsb
++//                                               ___      ,    XXX   ,      __    ,   XX  ,   _    , XXXXXXXXXX , _______  __ , _ , XXXXXXXXXX ,  __________
++//                       x10                     544      ,    444   ,      44    ,   44  ,   4    , 3333333333 , 2222222  22 , 2 , 1111111111 ,  0000000000
++//                        x1                     098      ,    765   ,      43    ,   21  ,   0    , 9876543210 , 9876543  21 , 0 , 9876543210 ,  9876543210
++//masks for the individual lstweak fields:
++#define E_LSTWEAK_XRANGE_MAP_MASK CONCAT12(0b,   111      ,    000   ,      00    ,   00  ,   0    , 0000000000 , 0000000, 00 , 0 , 0000000000 , 0000000000)
++#define E_LSTWEAK_XRANGE_MAP      CONCAT12(0b,   000      ,    111   ,      00    ,   00  ,   0    , 0000000000 , 0000000, 00 , 0 , 0000000000 , 0000000000)
++#define E_LSTWEAK_PRV_LVL_MASK    CONCAT12(0b,   000      ,    000   ,      11    ,   00  ,   0    , 0000000000 , 0000000, 00 , 0 , 0000000000 , 0000000000)
++#define E_LSTWEAK_PRV_LVL         CONCAT12(0b,   000      ,    000   ,      00    ,   11  ,   0    , 0000000000 , 0000000, 00 , 0 , 0000000000 , 0000000000)
++#define E_LSTWEAK_TWEAK_ENABLE    CONCAT12(0b,   000      ,    000   ,      00    ,   00  ,   1    , 0000000000 , 0000000, 00 , 0 , 0000000000 , 0000000000)
++#define E_LSTWEAK_PTE_MSB_MASK    CONCAT12(0b,   000      ,    000   ,      00    ,   00  ,   0    , 1111111111 , 0000000, 00 , 0 , 0000000000 , 0000000000)
++#define E_LSTWEAK_PTE_MSB         CONCAT12(0b,   000      ,    000   ,      00    ,   00  ,   0    , 0000000000 , 1111111, 11 , 1 , 0000000000 , 0000000000)
++#define E_LSTWEAK_PTE_LSB_MASK    CONCAT12(0b,   000      ,    000   ,      00    ,   00  ,   0    , 0000000000 , 0000000, 00 , 0 , 1111111111 , 0000000000)
++#define E_LSTWEAK_PTE_LSB         CONCAT12(0b,   000      ,    000   ,      00    ,   00  ,   0    , 0000000000 , 0000000, 00 , 0 , 0000000000 , 1111111111)
++//predefined tweaks:
++#define E_TWEAK_CLEAR             CONCAT12(0b,   000      ,    000   ,      00    ,   00  ,   0    , 0000000000 , 0000000, 00 , 0 , 0000000000 , 0000000000)
++#define E_TWEAK_MONITOR           CONCAT12(0b,   111      ,    000   ,      11    ,   11  ,   1    , 0000000111 , 0000000, 00 , 1 , 0000000110 , 0000000110)
++#define E_TWEAK_ENCLAVE           CONCAT12(0b,   111      ,    100   ,      11    ,   00  ,   1    , 0000000111 , 0000000, 01 , 1 , 0000000000 , 0000000000)
++#define E_TWEAK_SHCODE            CONCAT12(0b,   111      ,    100   ,      11    ,   00  ,   1    , 0000000111 , 0000000, 10 , 1 , 0000000100 , 0000000000)
++#define E_TWEAK_SHDATA            CONCAT12(0b,   111      ,    001   ,      11    ,   00  ,   1    , 0000000111 , 0000000, 11 , 1 , 0000001000 , 0000000000)
++#define E_TWEAK_UNPROTECTED_U     CONCAT12(0b,   111      ,    000   ,      11    ,   00  ,   1    , 0000000111 , 0000000, 00 , 1 , 1111111111 , 0000000000)
++
++// MSB bits for the PT entries, names are to make the intended page type more obvious in code
++// Make sure to shift left by E_MSB_SHIFT if or-ing
++//NOTE: these have nothing to do with the RSW bits.
++#define E_PT_UNPROTECTED (0)
++#define E_PT_REGULAR     (                    PTE_MSB_SOFT_SID0 | PTE_MSB_ENCRYPTED_PAGE)
++#define E_PT_SHDATA      (PTE_MSB_SOFT_SID1 | PTE_MSB_SOFT_SID0 | PTE_MSB_ENCRYPTED_PAGE)
++#define E_PT_SHCODE      (PTE_MSB_SOFT_SID1 |                     PTE_MSB_ENCRYPTED_PAGE)
++#define E_PT_MONITOR     (                                        PTE_MSB_ENCRYPTED_PAGE)
++
++#define PTE_PPN_SHIFT 10
+ #define PTE_TABLE(PTE) (((PTE) & (PTE_V | PTE_R | PTE_W | PTE_X)) == PTE_V)
+ 
++//for mmap related syscalls
++//shifted by PROT_E_SHIFT to avoid conflicts with pre-existing PROT_* values used in linux (and the proxykernel)
++#define PROT_E_SHIFT       12
++#define PROT_E_MASK        (( PTE_MSB_SOFT_SID_MASK | PTE_MSB_ENCRYPTED_PAGE ) << PROT_E_SHIFT)
++#define PROT_E_MONITOR     (( E_PT_MONITOR                                   ) << PROT_E_SHIFT)
++#define PROT_E_ENCLAVE     (( E_PT_REGULAR                                   ) << PROT_E_SHIFT)
++#define PROT_E_SHCODE      (( E_PT_SHCODE                                    ) << PROT_E_SHIFT)
++#define PROT_E_SHDATA      (( E_PT_SHDATA                                    ) << PROT_E_SHIFT)
++#define PROT_E_UNPROTECTED (( E_PT_UNPROTECTED                               ) << PROT_E_SHIFT)
++
++
+ #ifdef __riscv
+ 
+ #if __riscv_xlen == 64
+@@ -196,6 +289,8 @@
+ #endif
+ #define RISCV_PGSHIFT 12
+ #define RISCV_PGSIZE (1 << RISCV_PGSHIFT)
++//#define RISCV_MSTACKSIZE (1 << (RISCV_PGSHIFT+1))
++#define RISCV_MSTACKSIZE RISCV_PGSIZE
+ 
+ #ifndef __ASSEMBLER__
+ 
+@@ -276,6 +371,10 @@
+ #define MASK_FMV_X_S  0xfff0707f
+ #define MATCH_FMV_S_X 0xf0000053
+ #define MASK_FMV_S_X  0xfff0707f
++#define MATCH_FMV_X_Q 0xe6000053
++#define MASK_FMV_X_Q  0xfff0707f
++#define MATCH_FMV_Q_X 0xf6000053
++#define MASK_FMV_Q_X  0xfff0707f
+ #define MATCH_FENCE_TSO 0x8330000f
+ #define MASK_FENCE_TSO  0xfff0707f
+ #define MATCH_PAUSE 0x100000f
+@@ -640,10 +739,6 @@
+ #define MASK_FCVT_Q_L  0xfff0007f
+ #define MATCH_FCVT_Q_LU 0xd6300053
+ #define MASK_FCVT_Q_LU  0xfff0007f
+-#define MATCH_FMV_X_Q 0xe6000053
+-#define MASK_FMV_X_Q  0xfff0707f
+-#define MATCH_FMV_Q_X 0xf6000053
+-#define MASK_FMV_Q_X  0xfff0707f
+ #define MATCH_ECALL 0x73
+ #define MASK_ECALL  0xffffffff
+ #define MATCH_EBREAK 0x100073
+@@ -676,6 +771,8 @@
+ #define MASK_HFENCE_VVMA  0xfe007fff
+ #define MATCH_HFENCE_GVMA 0x62000073
+ #define MASK_HFENCE_GVMA  0xfe007fff
++#define MATCH_R_COUNTER_TREE 0xb
++#define MASK_R_COUNTER_TREE  0x707f
+ #define MATCH_C_NOP 0x1
+ #define MASK_C_NOP  0xffff
+ #define MATCH_C_ADDI16SP 0x6101
+@@ -1585,6 +1682,7 @@
+ #define CSR_VSTART 0x8
+ #define CSR_VXSAT 0x9
+ #define CSR_VXRM 0xa
++#define CSR_VCSR 0xf
+ #define CSR_USCRATCH 0x40
+ #define CSR_UEPC 0x41
+ #define CSR_UCAUSE 0x42
+@@ -1649,11 +1747,19 @@
+ #define CSR_HSTATUS 0x600
+ #define CSR_HEDELEG 0x602
+ #define CSR_HIDELEG 0x603
++#define CSR_HIE 0x604
++#define CSR_HTIMEDELTA 0x605
+ #define CSR_HCOUNTEREN 0x606
++#define CSR_HGEIE 0x607
++#define CSR_HTVAL 0x643
++#define CSR_HIP 0x644
++#define CSR_HVIP 0x645
++#define CSR_HTINST 0x64a
+ #define CSR_HGATP 0x680
++#define CSR_HGEIP 0xe12
+ #define CSR_UTVT 0x7
+-#define CSR_UNXTI 0x45
+-#define CSR_UINTSTATUS 0x46
++#define CSR_UNXTI 0xc37d
++#define CSR_UINTSTATUS 0xc766
+ #define CSR_USCRATCHCSW 0x48
+ #define CSR_USCRATCHCSWL 0x49
+ #define CSR_STVT 0x107
+@@ -1679,6 +1785,8 @@
+ #define CSR_MCAUSE 0x342
+ #define CSR_MTVAL 0x343
+ #define CSR_MIP 0x344
++#define CSR_MTINST 0x34a
++#define CSR_MTVAL2 0x34b
+ #define CSR_PMPCFG0 0x3a0
+ #define CSR_PMPCFG1 0x3a1
+ #define CSR_PMPCFG2 0x3a2
+@@ -1699,13 +1807,81 @@
+ #define CSR_PMPADDR13 0x3bd
+ #define CSR_PMPADDR14 0x3be
+ #define CSR_PMPADDR15 0x3bf
++#define CSR_E_SRANGE_VBASE 0x5c0
++#define CSR_E_SRANGE_VSIZE 0x5c1
++#define CSR_E_SSID_0 0x5c2
++#define CSR_E_SSID_1 0x5c3
++#define CSR_E_MRANGE_VBASE 0x7c0
++#define CSR_E_MRANGE_VSIZE 0x7c1
++#define CSR_E_MSID_0 0x7c2
++#define CSR_E_MSID_1 0x7c3
++#define CSR_E_LTWEAK 0x7c5
++#define CSR_E_LTWEAK_XRANGE_MAP 0x7c6
++#define CSR_E_LTWEAK_XRANGE_MAP_MASK 0x7c7
++#define CSR_E_LTWEAK_PRV_LVL 0x7c8
++#define CSR_E_LTWEAK_PRV_LVL_MASK 0x7c9
++#define CSR_E_LTWEAK_TWEAK_EN 0x7ca
++#define CSR_E_LTWEAK_PTE_MSB 0x7cb
++#define CSR_E_LTWEAK_PTE_MSB_MASK 0x7cc
++#define CSR_E_LTWEAK_PTE_LSB 0x7cd
++#define CSR_E_LTWEAK_PTE_LSB_MASK 0x7ce
++#define CSR_E_STWEAK 0x7cf
++#define CSR_E_STWEAK_XRANGE_MAP 0x7d0
++#define CSR_E_STWEAK_XRANGE_MAP_MASK 0x7d1
++#define CSR_E_STWEAK_PRV_LVL 0x7d2
++#define CSR_E_STWEAK_PRV_LVL_MASK 0x7d3
++#define CSR_E_STWEAK_TWEAK_EN 0x7d4
++#define CSR_E_STWEAK_PTE_MSB 0x7d5
++#define CSR_E_STWEAK_PTE_MSB_MASK 0x7d6
++#define CSR_E_STWEAK_PTE_LSB 0x7d7
++#define CSR_E_STWEAK_PTE_LSB_MASK 0x7d8
++#define CSR_E_STATUS 0x7d9
++#define CSR_E_SECS 0x7da
++#define CSR_E_TCS 0x7db
++#define CSR_E_URANGE_VBASE 0x801
++#define CSR_E_URANGE_VSIZE 0x802
++#define CSR_E_USID_0 0x803
++#define CSR_E_USID_1 0x804
++#define CSR_E_DBG_CONTROL 0x823
++#define CSR_E_DBG_MRANGE_VBASE 0x824
++#define CSR_E_DBG_MRANGE_VSIZE 0x825
++#define CSR_E_DBG_SRANGE_VBASE 0x826
++#define CSR_E_DBG_SRANGE_VSIZE 0x827
++#define CSR_E_DBG_MSID_0 0x828
++#define CSR_E_DBG_MSID_1 0x829
++#define CSR_E_DBG_SSID_0 0x82a
++#define CSR_E_DBG_SSID_1 0x82b
++#define CSR_E_DBG_LTWEAK 0x830
++#define CSR_E_DBG_LTWEAK_XRANGE_MAP 0x831
++#define CSR_E_DBG_LTWEAK_XRANGE_MAP_MASK 0x832
++#define CSR_E_DBG_LTWEAK_PRV_LVL 0x833
++#define CSR_E_DBG_LTWEAK_PRV_LVL_MASK 0x834
++#define CSR_E_DBG_LTWEAK_TWEAK_EN 0x835
++#define CSR_E_DBG_LTWEAK_PTE_MSB 0x836
++#define CSR_E_DBG_LTWEAK_PTE_MSB_MASK 0x837
++#define CSR_E_DBG_LTWEAK_PTE_LSB 0x838
++#define CSR_E_DBG_LTWEAK_PTE_LSB_MASK 0x839
++#define CSR_E_DBG_STWEAK 0x83a
++#define CSR_E_DBG_STWEAK_XRANGE_MAP 0x83b
++#define CSR_E_DBG_STWEAK_XRANGE_MAP_MASK 0x83c
++#define CSR_E_DBG_STWEAK_PRV_LVL 0x83d
++#define CSR_E_DBG_STWEAK_PRV_LVL_MASK 0x83e
++#define CSR_E_DBG_STWEAK_TWEAK_EN 0x83f
++#define CSR_E_DBG_STWEAK_PTE_MSB 0x840
++#define CSR_E_DBG_STWEAK_PTE_MSB_MASK 0x841
++#define CSR_E_DBG_STWEAK_PTE_LSB 0x842
++#define CSR_E_DBG_STWEAK_PTE_LSB_MASK 0x843
++#define CSR_E_DBG_STATUS 0x844
++#define CSR_E_DBG_SECS 0x845
++#define CSR_E_DBG_TCS 0x846
+ #define CSR_TSELECT 0x7a0
+ #define CSR_TDATA1 0x7a1
+ #define CSR_TDATA2 0x7a2
+ #define CSR_TDATA3 0x7a3
+ #define CSR_DCSR 0x7b0
+ #define CSR_DPC 0x7b1
+-#define CSR_DSCRATCH 0x7b2
++#define CSR_DSCRATCH0 0x7b2
++#define CSR_DSCRATCH1 0x7b3
+ #define CSR_MCYCLE 0xb00
+ #define CSR_MINSTRET 0xb02
+ #define CSR_MHPMCOUNTER3 0xb03
+@@ -1770,6 +1946,7 @@
+ #define CSR_MARCHID 0xf12
+ #define CSR_MIMPID 0xf13
+ #define CSR_MHARTID 0xf14
++#define CSR_HTIMEDELTAH 0x615
+ #define CSR_CYCLEH 0xc80
+ #define CSR_TIMEH 0xc81
+ #define CSR_INSTRETH 0xc82
+@@ -1802,6 +1979,8 @@
+ #define CSR_HPMCOUNTER29H 0xc9d
+ #define CSR_HPMCOUNTER30H 0xc9e
+ #define CSR_HPMCOUNTER31H 0xc9f
++#define CSR_E_SESSKEYHH 0x80
++#define CSR_MSTATUSH 0x310
+ #define CSR_MCYCLEH 0xb80
+ #define CSR_MINSTRETH 0xb82
+ #define CSR_MHPMCOUNTER3H 0xb83
+@@ -1833,6 +2012,7 @@
+ #define CSR_MHPMCOUNTER29H 0xb9d
+ #define CSR_MHPMCOUNTER30H 0xb9e
+ #define CSR_MHPMCOUNTER31H 0xb9f
++#define CSR_E_RTIDH 0xba0
+ #define CAUSE_MISALIGNED_FETCH 0x0
+ #define CAUSE_FETCH_ACCESS 0x1
+ #define CAUSE_ILLEGAL_INSTRUCTION 0x2
+@@ -1848,6 +2028,7 @@
+ #define CAUSE_FETCH_PAGE_FAULT 0xc
+ #define CAUSE_LOAD_PAGE_FAULT 0xd
+ #define CAUSE_STORE_PAGE_FAULT 0xf
++#define CAUSE_DECRYPTION_INTEGRITY_FAILURE 0x10
+ #endif
+ #ifdef DECLARE_INSN
+ DECLARE_INSN(slli_rv32, MATCH_SLLI_RV32, MASK_SLLI_RV32)
+@@ -1871,6 +2052,8 @@ DECLARE_INSN(scall, MATCH_SCALL, MASK_SCALL)
+ DECLARE_INSN(sbreak, MATCH_SBREAK, MASK_SBREAK)
+ DECLARE_INSN(fmv_x_s, MATCH_FMV_X_S, MASK_FMV_X_S)
+ DECLARE_INSN(fmv_s_x, MATCH_FMV_S_X, MASK_FMV_S_X)
++DECLARE_INSN(fmv_x_q, MATCH_FMV_X_Q, MASK_FMV_X_Q)
++DECLARE_INSN(fmv_q_x, MATCH_FMV_Q_X, MASK_FMV_Q_X)
+ DECLARE_INSN(fence_tso, MATCH_FENCE_TSO, MASK_FENCE_TSO)
+ DECLARE_INSN(pause, MATCH_PAUSE, MASK_PAUSE)
+ DECLARE_INSN(beq, MATCH_BEQ, MASK_BEQ)
+@@ -2053,8 +2236,6 @@ DECLARE_INSN(fcvt_l_q, MATCH_FCVT_L_Q, MASK_FCVT_L_Q)
+ DECLARE_INSN(fcvt_lu_q, MATCH_FCVT_LU_Q, MASK_FCVT_LU_Q)
+ DECLARE_INSN(fcvt_q_l, MATCH_FCVT_Q_L, MASK_FCVT_Q_L)
+ DECLARE_INSN(fcvt_q_lu, MATCH_FCVT_Q_LU, MASK_FCVT_Q_LU)
+-DECLARE_INSN(fmv_x_q, MATCH_FMV_X_Q, MASK_FMV_X_Q)
+-DECLARE_INSN(fmv_q_x, MATCH_FMV_Q_X, MASK_FMV_Q_X)
+ DECLARE_INSN(ecall, MATCH_ECALL, MASK_ECALL)
+ DECLARE_INSN(ebreak, MATCH_EBREAK, MASK_EBREAK)
+ DECLARE_INSN(uret, MATCH_URET, MASK_URET)
+@@ -2071,6 +2252,7 @@ DECLARE_INSN(csrrsi, MATCH_CSRRSI, MASK_CSRRSI)
+ DECLARE_INSN(csrrci, MATCH_CSRRCI, MASK_CSRRCI)
+ DECLARE_INSN(hfence_vvma, MATCH_HFENCE_VVMA, MASK_HFENCE_VVMA)
+ DECLARE_INSN(hfence_gvma, MATCH_HFENCE_GVMA, MASK_HFENCE_GVMA)
++DECLARE_INSN(r_counter_tree, MATCH_R_COUNTER_TREE, MASK_R_COUNTER_TREE)
+ DECLARE_INSN(c_nop, MATCH_C_NOP, MASK_C_NOP)
+ DECLARE_INSN(c_addi16sp, MATCH_C_ADDI16SP, MASK_C_ADDI16SP)
+ DECLARE_INSN(c_jr, MATCH_C_JR, MASK_C_JR)
+@@ -2532,6 +2714,7 @@ DECLARE_CSR(utvec, CSR_UTVEC)
+ DECLARE_CSR(vstart, CSR_VSTART)
+ DECLARE_CSR(vxsat, CSR_VXSAT)
+ DECLARE_CSR(vxrm, CSR_VXRM)
++DECLARE_CSR(vcsr, CSR_VCSR)
+ DECLARE_CSR(uscratch, CSR_USCRATCH)
+ DECLARE_CSR(uepc, CSR_UEPC)
+ DECLARE_CSR(ucause, CSR_UCAUSE)
+@@ -2596,8 +2779,16 @@ DECLARE_CSR(vsatp, CSR_VSATP)
+ DECLARE_CSR(hstatus, CSR_HSTATUS)
+ DECLARE_CSR(hedeleg, CSR_HEDELEG)
+ DECLARE_CSR(hideleg, CSR_HIDELEG)
++DECLARE_CSR(hie, CSR_HIE)
++DECLARE_CSR(htimedelta, CSR_HTIMEDELTA)
+ DECLARE_CSR(hcounteren, CSR_HCOUNTEREN)
++DECLARE_CSR(hgeie, CSR_HGEIE)
++DECLARE_CSR(htval, CSR_HTVAL)
++DECLARE_CSR(hip, CSR_HIP)
++DECLARE_CSR(hvip, CSR_HVIP)
++DECLARE_CSR(htinst, CSR_HTINST)
+ DECLARE_CSR(hgatp, CSR_HGATP)
++DECLARE_CSR(hgeip, CSR_HGEIP)
+ DECLARE_CSR(utvt, CSR_UTVT)
+ DECLARE_CSR(unxti, CSR_UNXTI)
+ DECLARE_CSR(uintstatus, CSR_UINTSTATUS)
+@@ -2626,6 +2817,8 @@ DECLARE_CSR(mepc, CSR_MEPC)
+ DECLARE_CSR(mcause, CSR_MCAUSE)
+ DECLARE_CSR(mtval, CSR_MTVAL)
+ DECLARE_CSR(mip, CSR_MIP)
++DECLARE_CSR(mtinst, CSR_MTINST)
++DECLARE_CSR(mtval2, CSR_MTVAL2)
+ DECLARE_CSR(pmpcfg0, CSR_PMPCFG0)
+ DECLARE_CSR(pmpcfg1, CSR_PMPCFG1)
+ DECLARE_CSR(pmpcfg2, CSR_PMPCFG2)
+@@ -2646,13 +2839,81 @@ DECLARE_CSR(pmpaddr12, CSR_PMPADDR12)
+ DECLARE_CSR(pmpaddr13, CSR_PMPADDR13)
+ DECLARE_CSR(pmpaddr14, CSR_PMPADDR14)
+ DECLARE_CSR(pmpaddr15, CSR_PMPADDR15)
++DECLARE_CSR(E_srange_vbase, CSR_E_SRANGE_VBASE)
++DECLARE_CSR(E_srange_vsize, CSR_E_SRANGE_VSIZE)
++DECLARE_CSR(E_ssid_0, CSR_E_SSID_0)
++DECLARE_CSR(E_ssid_1, CSR_E_SSID_1)
++DECLARE_CSR(E_mrange_vbase, CSR_E_MRANGE_VBASE)
++DECLARE_CSR(E_mrange_vsize, CSR_E_MRANGE_VSIZE)
++DECLARE_CSR(E_msid_0, CSR_E_MSID_0)
++DECLARE_CSR(E_msid_1, CSR_E_MSID_1)
++DECLARE_CSR(E_ltweak, CSR_E_LTWEAK)
++DECLARE_CSR(E_ltweak_xrange_map, CSR_E_LTWEAK_XRANGE_MAP)
++DECLARE_CSR(E_ltweak_xrange_map_mask, CSR_E_LTWEAK_XRANGE_MAP_MASK)
++DECLARE_CSR(E_ltweak_prv_lvl, CSR_E_LTWEAK_PRV_LVL)
++DECLARE_CSR(E_ltweak_prv_lvl_mask, CSR_E_LTWEAK_PRV_LVL_MASK)
++DECLARE_CSR(E_ltweak_tweak_en, CSR_E_LTWEAK_TWEAK_EN)
++DECLARE_CSR(E_ltweak_pte_msb, CSR_E_LTWEAK_PTE_MSB)
++DECLARE_CSR(E_ltweak_pte_msb_mask, CSR_E_LTWEAK_PTE_MSB_MASK)
++DECLARE_CSR(E_ltweak_pte_lsb, CSR_E_LTWEAK_PTE_LSB)
++DECLARE_CSR(E_ltweak_pte_lsb_mask, CSR_E_LTWEAK_PTE_LSB_MASK)
++DECLARE_CSR(E_stweak, CSR_E_STWEAK)
++DECLARE_CSR(E_stweak_xrange_map, CSR_E_STWEAK_XRANGE_MAP)
++DECLARE_CSR(E_stweak_xrange_map_mask, CSR_E_STWEAK_XRANGE_MAP_MASK)
++DECLARE_CSR(E_stweak_prv_lvl, CSR_E_STWEAK_PRV_LVL)
++DECLARE_CSR(E_stweak_prv_lvl_mask, CSR_E_STWEAK_PRV_LVL_MASK)
++DECLARE_CSR(E_stweak_tweak_en, CSR_E_STWEAK_TWEAK_EN)
++DECLARE_CSR(E_stweak_pte_msb, CSR_E_STWEAK_PTE_MSB)
++DECLARE_CSR(E_stweak_pte_msb_mask, CSR_E_STWEAK_PTE_MSB_MASK)
++DECLARE_CSR(E_stweak_pte_lsb, CSR_E_STWEAK_PTE_LSB)
++DECLARE_CSR(E_stweak_pte_lsb_mask, CSR_E_STWEAK_PTE_LSB_MASK)
++DECLARE_CSR(E_status, CSR_E_STATUS)
++DECLARE_CSR(E_secs, CSR_E_SECS)
++DECLARE_CSR(E_tcs, CSR_E_TCS)
++DECLARE_CSR(E_urange_vbase, CSR_E_URANGE_VBASE)
++DECLARE_CSR(E_urange_vsize, CSR_E_URANGE_VSIZE)
++DECLARE_CSR(E_usid_0, CSR_E_USID_0)
++DECLARE_CSR(E_usid_1, CSR_E_USID_1)
++DECLARE_CSR(E_dbg_control, CSR_E_DBG_CONTROL)
++DECLARE_CSR(E_dbg_mrange_vbase, CSR_E_DBG_MRANGE_VBASE)
++DECLARE_CSR(E_dbg_mrange_vsize, CSR_E_DBG_MRANGE_VSIZE)
++DECLARE_CSR(E_dbg_srange_vbase, CSR_E_DBG_SRANGE_VBASE)
++DECLARE_CSR(E_dbg_srange_vsize, CSR_E_DBG_SRANGE_VSIZE)
++DECLARE_CSR(E_dbg_msid_0, CSR_E_DBG_MSID_0)
++DECLARE_CSR(E_dbg_msid_1, CSR_E_DBG_MSID_1)
++DECLARE_CSR(E_dbg_ssid_0, CSR_E_DBG_SSID_0)
++DECLARE_CSR(E_dbg_ssid_1, CSR_E_DBG_SSID_1)
++DECLARE_CSR(E_dbg_ltweak, CSR_E_DBG_LTWEAK)
++DECLARE_CSR(E_dbg_ltweak_xrange_map, CSR_E_DBG_LTWEAK_XRANGE_MAP)
++DECLARE_CSR(E_dbg_ltweak_xrange_map_mask, CSR_E_DBG_LTWEAK_XRANGE_MAP_MASK)
++DECLARE_CSR(E_dbg_ltweak_prv_lvl, CSR_E_DBG_LTWEAK_PRV_LVL)
++DECLARE_CSR(E_dbg_ltweak_prv_lvl_mask, CSR_E_DBG_LTWEAK_PRV_LVL_MASK)
++DECLARE_CSR(E_dbg_ltweak_tweak_en, CSR_E_DBG_LTWEAK_TWEAK_EN)
++DECLARE_CSR(E_dbg_ltweak_pte_msb, CSR_E_DBG_LTWEAK_PTE_MSB)
++DECLARE_CSR(E_dbg_ltweak_pte_msb_mask, CSR_E_DBG_LTWEAK_PTE_MSB_MASK)
++DECLARE_CSR(E_dbg_ltweak_pte_lsb, CSR_E_DBG_LTWEAK_PTE_LSB)
++DECLARE_CSR(E_dbg_ltweak_pte_lsb_mask, CSR_E_DBG_LTWEAK_PTE_LSB_MASK)
++DECLARE_CSR(E_dbg_stweak, CSR_E_DBG_STWEAK)
++DECLARE_CSR(E_dbg_stweak_xrange_map, CSR_E_DBG_STWEAK_XRANGE_MAP)
++DECLARE_CSR(E_dbg_stweak_xrange_map_mask, CSR_E_DBG_STWEAK_XRANGE_MAP_MASK)
++DECLARE_CSR(E_dbg_stweak_prv_lvl, CSR_E_DBG_STWEAK_PRV_LVL)
++DECLARE_CSR(E_dbg_stweak_prv_lvl_mask, CSR_E_DBG_STWEAK_PRV_LVL_MASK)
++DECLARE_CSR(E_dbg_stweak_tweak_en, CSR_E_DBG_STWEAK_TWEAK_EN)
++DECLARE_CSR(E_dbg_stweak_pte_msb, CSR_E_DBG_STWEAK_PTE_MSB)
++DECLARE_CSR(E_dbg_stweak_pte_msb_mask, CSR_E_DBG_STWEAK_PTE_MSB_MASK)
++DECLARE_CSR(E_dbg_stweak_pte_lsb, CSR_E_DBG_STWEAK_PTE_LSB)
++DECLARE_CSR(E_dbg_stweak_pte_lsb_mask, CSR_E_DBG_STWEAK_PTE_LSB_MASK)
++DECLARE_CSR(E_dbg_status, CSR_E_DBG_STATUS)
++DECLARE_CSR(E_dbg_secs, CSR_E_DBG_SECS)
++DECLARE_CSR(E_dbg_tcs, CSR_E_DBG_TCS)
+ DECLARE_CSR(tselect, CSR_TSELECT)
+ DECLARE_CSR(tdata1, CSR_TDATA1)
+ DECLARE_CSR(tdata2, CSR_TDATA2)
+ DECLARE_CSR(tdata3, CSR_TDATA3)
+ DECLARE_CSR(dcsr, CSR_DCSR)
+ DECLARE_CSR(dpc, CSR_DPC)
+-DECLARE_CSR(dscratch, CSR_DSCRATCH)
++DECLARE_CSR(dscratch0, CSR_DSCRATCH0)
++DECLARE_CSR(dscratch1, CSR_DSCRATCH1)
+ DECLARE_CSR(mcycle, CSR_MCYCLE)
+ DECLARE_CSR(minstret, CSR_MINSTRET)
+ DECLARE_CSR(mhpmcounter3, CSR_MHPMCOUNTER3)
+@@ -2717,6 +2978,7 @@ DECLARE_CSR(mvendorid, CSR_MVENDORID)
+ DECLARE_CSR(marchid, CSR_MARCHID)
+ DECLARE_CSR(mimpid, CSR_MIMPID)
+ DECLARE_CSR(mhartid, CSR_MHARTID)
++DECLARE_CSR(htimedeltah, CSR_HTIMEDELTAH)
+ DECLARE_CSR(cycleh, CSR_CYCLEH)
+ DECLARE_CSR(timeh, CSR_TIMEH)
+ DECLARE_CSR(instreth, CSR_INSTRETH)
+@@ -2749,6 +3011,8 @@ DECLARE_CSR(hpmcounter28h, CSR_HPMCOUNTER28H)
+ DECLARE_CSR(hpmcounter29h, CSR_HPMCOUNTER29H)
+ DECLARE_CSR(hpmcounter30h, CSR_HPMCOUNTER30H)
+ DECLARE_CSR(hpmcounter31h, CSR_HPMCOUNTER31H)
++DECLARE_CSR(E_sesskeyhh, CSR_E_SESSKEYHH)
++DECLARE_CSR(mstatush, CSR_MSTATUSH)
+ DECLARE_CSR(mcycleh, CSR_MCYCLEH)
+ DECLARE_CSR(minstreth, CSR_MINSTRETH)
+ DECLARE_CSR(mhpmcounter3h, CSR_MHPMCOUNTER3H)
+@@ -2780,6 +3044,7 @@ DECLARE_CSR(mhpmcounter28h, CSR_MHPMCOUNTER28H)
+ DECLARE_CSR(mhpmcounter29h, CSR_MHPMCOUNTER29H)
+ DECLARE_CSR(mhpmcounter30h, CSR_MHPMCOUNTER30H)
+ DECLARE_CSR(mhpmcounter31h, CSR_MHPMCOUNTER31H)
++DECLARE_CSR(E_rtidh, CSR_E_RTIDH)
+ #endif
+ #ifdef DECLARE_CAUSE
+ DECLARE_CAUSE("misaligned fetch", CAUSE_MISALIGNED_FETCH)
+@@ -2797,4 +3062,5 @@ DECLARE_CAUSE("machine_ecall", CAUSE_MACHINE_ECALL)
+ DECLARE_CAUSE("fetch page fault", CAUSE_FETCH_PAGE_FAULT)
+ DECLARE_CAUSE("load page fault", CAUSE_LOAD_PAGE_FAULT)
+ DECLARE_CAUSE("store page fault", CAUSE_STORE_PAGE_FAULT)
++DECLARE_CAUSE("decryption_integrity_failure", CAUSE_DECRYPTION_INTEGRITY_FAILURE)
+ #endif
+diff --git a/machine/encrypt.c b/machine/encrypt.c
+new file mode 100644
+index 0000000..6f01c4b
+--- /dev/null
++++ b/machine/encrypt.c
+@@ -0,0 +1,99 @@
++#include "sm.h"
++
++#include "api.h"
++#include "endian.h"
++#include "permutations.h"
++
++#define RATE (128 / 8)
++#define PA_ROUNDS 12
++#define PB_ROUNDS 8
++#define IV                                                        \
++  ((u64)(8 * (CRYPTO_KEYBYTES)) << 56 | (u64)(8 * (RATE)) << 48 | \
++   (u64)(PA_ROUNDS) << 40 | (u64)(PB_ROUNDS) << 32)
++
++int crypto_aead_encrypt(unsigned char* c, unsigned long long* clen,
++                        const unsigned char* m, unsigned long long mlen,
++                        const unsigned char* ad, unsigned long long adlen,
++                        const unsigned char* nsec, const unsigned char* npub,
++                        const unsigned char* k) {
++  const u64 K0 = LOAD64_NOTWEAK(k);
++  const u64 K1 = LOAD64_NOTWEAK(k + 8);
++  const u64 N0 = LOAD64_NOTWEAK(npub);
++  const u64 N1 = LOAD64_NOTWEAK(npub + 8);
++  state s;
++  u64 i;
++  (void)nsec;
++
++  /* set ciphertext size */
++  *clen = mlen + CRYPTO_ABYTES;
++
++  /* initialization */
++  s.x0 = IV;
++  s.x1 = K0;
++  s.x2 = K1;
++  s.x3 = N0;
++  s.x4 = N1;
++  P12();
++  s.x3 ^= K0;
++  s.x4 ^= K1;
++
++  /* process associated data */
++  if (adlen) {
++    while (adlen >= RATE) {
++      s.x0 ^= LOAD64_NOTWEAK(ad);
++      s.x1 ^= LOAD64_NOTWEAK(ad + 8);
++      P8();
++      adlen -= RATE;
++      ad += RATE;
++    }
++    for (i = 0; i < adlen; ++i, ++ad)
++      if (i < 8)
++        s.x0 ^= INS_BYTE64(*ad, i);
++      else
++        s.x1 ^= INS_BYTE64(*ad, i % 8);
++    if (adlen < 8)
++      s.x0 ^= INS_BYTE64(0x80, adlen);
++    else
++      s.x1 ^= INS_BYTE64(0x80, adlen % 8);
++    P8();
++  }
++  s.x4 ^= 1;
++
++  /* process plaintext */
++  while (mlen >= RATE) {
++    s.x0 ^= LOAD64_NOTWEAK(m);
++    s.x1 ^= LOAD64_NOTWEAK(m + 8);
++    STORE64_NOTWEAK(c, s.x0);
++    STORE64_NOTWEAK((c + 8), s.x1);
++    P8();
++    mlen -= RATE;
++    m += RATE;
++    c += RATE;
++  }
++  for (i = 0; i < mlen; ++i, ++m, ++c) {
++    if (i < 8) {
++      s.x0 ^= INS_BYTE64(*m, i);
++      *c = EXT_BYTE64(s.x0, i);
++    } else {
++      s.x1 ^= INS_BYTE64(*m, i % 8);
++      *c = EXT_BYTE64(s.x1, i % 8);
++    }
++  }
++  if (mlen < 8)
++    s.x0 ^= INS_BYTE64(0x80, mlen);
++  else
++    s.x1 ^= INS_BYTE64(0x80, mlen % 8);
++
++  /* finalization */
++  s.x2 ^= K0;
++  s.x3 ^= K1;
++  P12();
++  s.x3 ^= K0;
++  s.x4 ^= K1;
++
++  /* set tag */
++  STORE64_NOTWEAK(c, s.x3);
++  STORE64_NOTWEAK((c + 8), s.x4);
++
++  return 0;
++}
+diff --git a/machine/endian.h b/machine/endian.h
+new file mode 100644
+index 0000000..c6488c8
+--- /dev/null
++++ b/machine/endian.h
+@@ -0,0 +1,128 @@
++#include <stdint.h>
++
++#ifndef ENDIAN_H_
++#define ENDIAN_H_
++
++typedef unsigned char u8;
++typedef unsigned long long u64;
++
++/* define default Ascon data access */
++#if !defined(ASCON_UNALIGNED) && !defined(ASCON_MEMCPY) && \
++    !defined(ASCON_BYTEWISE)
++#define ASCON_MEMCPY
++#endif
++
++#define EXT_BYTE64(x, n) ((u8)((u64)(x) >> (8 * (7 - (n)))))
++#define INS_BYTE64(x, n) ((u64)(x) << (8 * (7 - (n))))
++
++#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
++
++/* macros for big endian machines */
++#ifndef NDEBUG
++#pragma message("Using macros for big endian machines")
++#endif
++#define U64BIG(x) (x)
++#define U32BIG(x) (x)
++#define U16BIG(x) (x)
++
++#elif defined(_MSC_VER) || \
++    (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
++
++/* macros for little endian machines */
++#ifndef NDEBUG
++#pragma message("Using macros for little endian machines")
++#endif
++#define U64BIG(x)                                                              \
++  ((((x)&0x00000000000000FFULL) << 56) | (((x)&0x000000000000FF00ULL) << 40) | \
++   (((x)&0x0000000000FF0000ULL) << 24) | (((x)&0x00000000FF000000ULL) << 8) |  \
++   (((x)&0x000000FF00000000ULL) >> 8) | (((x)&0x0000FF0000000000ULL) >> 24) |  \
++   (((x)&0x00FF000000000000ULL) >> 40) | (((x)&0xFF00000000000000ULL) >> 56))
++#define U32BIG(x)                                       \
++  ((((x)&0x000000FF) << 24) | (((x)&0x0000FF00) << 8) | \
++   (((x)&0x00FF0000) >> 8) | (((x)&0xFF000000) >> 24))
++#define U16BIG(x) ((((x)&0x00FF) << 8) | (((x)&0xFF00) >> 8))
++
++#else
++#error "Ascon byte order macros not defined in endian.h"
++#endif
++
++#if defined(ASCON_UNALIGNED)
++
++#ifndef NDEBUG
++#pragma message("Using unaligned data access")
++#endif
++
++#define LOAD64(x) (U64BIG(*(u64*)(x)))
++#define STORE64(x, y) (*(u64*)(x) = U64BIG(y))
++#error message("This should not happen")
++
++#elif defined(ASCON_MEMCPY)
++
++#ifndef NDEBUG
++#pragma message("Using memcpy to access data")
++#endif
++
++#include <string.h>
++
++
++static inline u64 LOAD64_KEY(const u8* bytes) {
++  return (U64BIG(*(u64*)(bytes)));
++}
++static inline u64 LOAD64_NONCE(const u8* bytes) {
++  return (U64BIG(*(u64*)(bytes)));
++}
++static inline u64 LOAD64_AD(const u8* bytes) {
++  return (U64BIG(*(u64*)(bytes)));
++}
++
++static inline u64 LOAD64_NOTWEAK(const u8* bytes) {
++  return (U64BIG(*(u64*)(bytes)));
++}
++
++static inline u64 LOAD64(const u8* bytes) {
++  u64 ret_val;
++  ret_val = virtualload_uint64_t((uint64_t*)bytes);
++  return U64BIG(ret_val);
++}
++
++static inline void STORE64_NOTWEAK(u8* bytes, u64 y) {
++  (*(u64*)(bytes) = U64BIG(y));
++}
++
++static inline void STORE64(u8* bytes, u64 y) {
++  y = U64BIG(y);
++  tweakstorefast_uint64_t((uint64_t*)bytes, y);
++}
++
++
++#elif defined(ASCON_BYTEWISE)
++
++#ifndef NDEBUG
++#pragma message("Using bytewise data access")
++#endif
++
++#error message("This should not happen")
++
++static inline u64 LOAD64(const u8* bytes) {
++  u64 ret_val = 0;
++  u8 i;
++  for (i = 0; i < 8; i++) {
++    ret_val |= (((u64)*bytes) << ((7 - i) << 3));
++    bytes++;
++  }
++  return ret_val;
++}
++
++static inline void STORE64(u8* bytes, u64 y) {
++  u8 i;
++  for (i = 0; i < 8; i++) {
++    *bytes = (y) >> ((7 - i) << 3);
++    bytes++;
++  }
++}
++
++#else
++#error "Ascon data access macros not defined in endian.h"
++#endif
++
++#endif /* ENDIAN_H_ */
+diff --git a/machine/fdt.c b/machine/fdt.c
+index fee3ae9..eebb6ec 100644
+--- a/machine/fdt.c
++++ b/machine/fdt.c
+@@ -126,11 +126,6 @@ const uint32_t *fdt_get_size(const struct fdt_scan_node *node, const uint32_t *v
+   return value;
+ }
+ 
+-uint32_t fdt_get_value(const struct fdt_scan_prop *prop, uint32_t index)
+-{
+-  return bswap(prop->value[index]);
+-}
+-
+ int fdt_string_list_index(const struct fdt_scan_prop *prop, const char *str)
+ {
+   const char *list = (const char *)prop->value;
+@@ -144,6 +139,13 @@ int fdt_string_list_index(const struct fdt_scan_prop *prop, const char *str)
+   return -1;
+ }
+ 
++const uint32_t *fdt_get_value(const uint32_t *value, uint32_t *result)
++{
++  *result = bswap(*value++);
++  return value;
++}
++
++
+ //////////////////////////////////////////// MEMORY SCAN /////////////////////////////////////////
+ 
+ struct mem_scan {
+diff --git a/machine/fdt.h b/machine/fdt.h
+index 056f292..b484ded 100644
+--- a/machine/fdt.h
++++ b/machine/fdt.h
+@@ -52,9 +52,9 @@ void fdt_scan(uintptr_t fdt, const struct fdt_cb *cb);
+ uint32_t fdt_size(uintptr_t fdt);
+ 
+ // Extract fields
+-const uint32_t *fdt_get_address(const struct fdt_scan_node *node, const uint32_t *base, uint64_t *value);
+-const uint32_t *fdt_get_size(const struct fdt_scan_node *node, const uint32_t *base, uint64_t *value);
+-uint32_t fdt_get_value(const struct fdt_scan_prop *prop, uint32_t index);
++const uint32_t *fdt_get_address(const struct fdt_scan_node *node, const uint32_t *value, uint64_t *result);
++const uint32_t *fdt_get_size(const struct fdt_scan_node *node, const uint32_t *value, uint64_t *result);
++const uint32_t *fdt_get_value(const uint32_t *value, uint32_t *result);
+ int fdt_string_list_index(const struct fdt_scan_prop *prop, const char *str); // -1 if not found
+ 
+ // Setup memory+clint+plic
+diff --git a/machine/machine.mk.in b/machine/machine.mk.in
+index dcecb7a..5f39b3f 100644
+--- a/machine/machine.mk.in
++++ b/machine/machine.mk.in
+@@ -7,6 +7,7 @@ machine_hdrs = \
+   atomic.h \
+   bits.h \
+   fdt.h \
++  sm.h \
+   emulation.h \
+   encoding.h \
+   fp_emulation.h \
+@@ -14,25 +15,37 @@ machine_hdrs = \
+   mcall.h \
+   mtrap.h \
+   uart.h \
++  uart16750.h \
+   uart16550.h \
++  uart_lite.h \
+   finisher.h \
+   unprivileged_memory.h \
+   vm.h \
++  \
++  api.h \
++  endian.h \
++  permutations.h \
+ 
+ machine_c_srcs = \
+   fdt.c \
+   mtrap.c \
+   minit.c \
+   htif.c \
++  sm.c \
+   emulation.c \
+   muldiv_emulation.c \
+   fp_emulation.c \
+   fp_ldst.c \
+   uart.c \
++  uart16750.c \
+   uart16550.c \
++  uart_lite.c \
+   finisher.c \
+   misaligned_ldst.c \
+   flush_icache.c \
++  \
++  encrypt.c \
++  decrypt.c \
+ 
+ machine_asm_srcs = \
+   mentry.S \
+diff --git a/machine/mentry.S b/machine/mentry.S
+index 9ec9916..0dd125d 100644
+--- a/machine/mentry.S
++++ b/machine/mentry.S
+@@ -3,35 +3,53 @@
+ #include "mtrap.h"
+ #include "bits.h"
+ #include "config.h"
++.weak _bss_end
+ 
+   .data
+   .align 6
+ trap_table:
+ #define BAD_TRAP_VECTOR 0
+-  .dc.a bad_trap
+-  .dc.a pmp_trap
+-  .dc.a illegal_insn_trap
+-  .dc.a bad_trap
+-  .dc.a misaligned_load_trap
+-  .dc.a pmp_trap
+-  .dc.a misaligned_store_trap
+-  .dc.a pmp_trap
+-  .dc.a bad_trap
+-  .dc.a mcall_trap
+-  .dc.a bad_trap
++  .dc.a bad_trap                 // 0 Instruction address misaligned
++  .dc.a pmp_trap                 // 1 Instruction access fault
++  .dc.a illegal_insn_trap        // 2 illegal instruction
++  .dc.a bad_trap                 // 3 breakpoint
++  .dc.a misaligned_load_trap     // 4 Load address misaligned
++  .dc.a pmp_trap                 // 5 Load access fault
++  .dc.a misaligned_store_trap    // 6 Store/AMO address misaligned
++  .dc.a pmp_trap                 // 7 Store/AMO access fault
++  .dc.a bad_trap                 // 8 Environment call from U-mode
++  .dc.a mcall_trap               // 9 Environment call from S-mode
++  .dc.a bad_trap                 // 10 Reserved
+ #ifdef BBL_BOOT_MACHINE
+-  .dc.a mcall_trap
++  .dc.a mcall_trap               // 11 Environment call from M-mode
+ #else
+-  .dc.a bad_trap
++  .dc.a bad_trap                 // 11 Environment call from M-mode
+ #endif /* BBL_BOOT_MACHINE */
+-  .dc.a bad_trap
++  .dc.a bad_trap                 // 12 Instruction page fault
+ #define TRAP_FROM_MACHINE_MODE_VECTOR 13
+-  .dc.a __trap_from_machine_mode
+-  .dc.a bad_trap
+-  .dc.a bad_trap
++  .dc.a __trap_from_machine_mode // 13 Load page fault
++  .dc.a bad_trap                 // 14 Reserved
++  .dc.a bad_trap                 // 15 Store/AMO page fault
++
++  //interrupts:
++#ifdef SM_INTERRUPT_HANDLING
++  .dc.a interrupt_trap           // 16 +  0 User software interrupt
++  .dc.a interrupt_trap           // 16 +  1 Supervisor software interrupt
++  .dc.a interrupt_trap           // 16 +  2 Reserved
++  .dc.a interrupt_trap           // 16 +  3 Machine software interrupt
++  .dc.a interrupt_trap           // 16 +  4 User timer interrupt
++  .dc.a interrupt_trap           // 16 +  5 Supervisor timer interrupt
++  .dc.a interrupt_trap           // 16 +  6 Reserved
++  .dc.a interrupt_trap           // 16 +  7 Machine timer interrupt
++  .dc.a interrupt_trap           // 16 +  8 User external interrupt
++  .dc.a interrupt_trap           // 16 +  9 Supervisor external interrupt
++  .dc.a interrupt_trap           // 16 + 10 Reserved
++  .dc.a interrupt_trap           // 16 + 11 Machine external interrupt
++#endif
+ 
+   .option norvc
+   .section .text.init,"ax",@progbits
++
+   .globl reset_vector
+ reset_vector:
+   j do_reset
+@@ -49,6 +67,20 @@ trap_vector:
+   # This is an interrupt.  Discard the mcause MSB and decode the rest.
+   sll a1, a1, 1
+ 
++#ifdef SM_INTERRUPT_HANDLING
++  //-----------------------
++  csrr a0, CSR_E_STATUS
++  beqz a0, .Linterrupt_not_enclave
++  li a0, IRQ_M_SOFT * 2 // IPI
++  beq a0, a1, .Linterrupt_not_enclave
++
++  srl a1, a1, 1 //shift back
++  addi a1, a1, 16 //add 16 (so we can misuse/reuse the trap table)
++  j .Lhandle_trap_in_machine_mode
++.Linterrupt_not_enclave:
++#endif
++  //-----------------------
++
+   # Is it a machine timer interrupt?
+   li a0, IRQ_M_TIMER * 2
+   bne a0, a1, 1f
+@@ -261,7 +293,7 @@ do_reset:
+   csrr t1, mtvec
+ 1:bne t0, t1, 1b
+ 
+-  la sp, stacks + RISCV_PGSIZE - MENTRY_FRAME_SIZE
++  la sp, stacks + MACHINE_STACK_SIZE - MENTRY_FRAME_SIZE
+ 
+   csrr a3, mhartid
+   slli a2, a3, RISCV_PGSHIFT
+@@ -316,4 +348,4 @@ do_reset:
+   .bss
+   .align RISCV_PGSHIFT
+ stacks:
+-  .skip RISCV_PGSIZE * MAX_HARTS
++  .skip MACHINE_STACK_SIZE * MAX_HARTS
+diff --git a/machine/minit.c b/machine/minit.c
+index a1befd1..b3bf955 100644
+--- a/machine/minit.c
++++ b/machine/minit.c
+@@ -7,6 +7,8 @@
+ #include "fdt.h"
+ #include "uart.h"
+ #include "uart16550.h"
++#include "uart16750.h"
++#include "uart_lite.h"
+ #include "finisher.h"
+ #include "disabled_hart_mask.h"
+ #include "htif.h"
+@@ -50,6 +52,7 @@ static void mstatus_init()
+ }
+ 
+ // send S-mode interrupts and most exceptions straight to S-mode
++/*
+ static void delegate_traps()
+ {
+   if (!supports_extension('S'))
+@@ -69,6 +72,7 @@ static void delegate_traps()
+   assert(read_csr(mideleg) == interrupts);
+   assert(read_csr(medeleg) == exceptions);
+ }
++*/
+ 
+ static void fp_init()
+ {
+@@ -173,6 +177,8 @@ void init_first_hart(uintptr_t hartid, uintptr_t dtb)
+   // Confirm console as early as possible
+   query_uart(dtb);
+   query_uart16550(dtb);
++  query_uart16750(dtb);
++  query_uart_lite(dtb);
+   query_htif(dtb);
+   printm("bbl loader\r\n");
+ 
+diff --git a/machine/mtrap.c b/machine/mtrap.c
+index 42006b8..be7f8a7 100644
+--- a/machine/mtrap.c
++++ b/machine/mtrap.c
+@@ -8,6 +8,8 @@
+ #include "vm.h"
+ #include "uart.h"
+ #include "uart16550.h"
++#include "uart16750.h"
++#include "uart_lite.h"
+ #include "finisher.h"
+ #include "fdt.h"
+ #include "unprivileged_memory.h"
+@@ -16,17 +18,128 @@
+ #include <stdarg.h>
+ #include <stdio.h>
+ 
++#include "sm.h" //for sm_thread_regs_t
++
++
++#define print_csr(csr_name, str_end) do { \
++  uint64_t val = CSRR(csr_name); \
++  char * color = ""; \
++  char name[256]; \
++  char * p = #csr_name; \
++  char * name2 = name; \
++  while(*p){*name2++ = *p++;} \
++  while(name2 - name < 29){*name2++ = ' ';} \
++  *name2++ = '\0'; \
++  if(!val){color = "\x1b[90m";} \
++  printm("%30s = %s0x%16lx%s%s", name, color, val, "\x1b[0m", str_end); \
++} while(0)
++
++static void _print_e_csrs()
++{
++  print_csr(CSR_E_USID_0                , "\n");
++  print_csr(CSR_E_USID_1                , "\n");
++  print_csr(CSR_E_SSID_0                , "\n");
++  print_csr(CSR_E_SSID_1                , "\n");
++  print_csr(CSR_E_MSID_0                , "\n");
++  print_csr(CSR_E_MSID_1                , "\n");
++  print_csr(CSR_E_DBG_CONTROL           , "\n");
++  print_csr(CSR_E_URANGE_VBASE          , "\n");
++  print_csr(CSR_E_URANGE_VSIZE          , "\n");
++  print_csr(CSR_E_SRANGE_VBASE          , "\n");
++  print_csr(CSR_E_SRANGE_VSIZE          , "\n");
++  print_csr(CSR_E_MRANGE_VBASE          , "\n");
++  print_csr(CSR_E_MRANGE_VSIZE          , "\n");
++  print_csr(CSR_E_SECS                  , "\n");
++  print_csr(CSR_E_TCS                   , "\n");
++  print_csr(CSR_E_STATUS                , "\n");
++  print_csr(CSR_E_LTWEAK                , "  ");
++  print_csr(CSR_E_STWEAK                , "\n");
++  print_csr(CSR_E_LTWEAK_TWEAK_EN       , "  ");
++  print_csr(CSR_E_STWEAK_TWEAK_EN       , "\n");
++  print_csr(CSR_E_LTWEAK_PRV_LVL        , "  ");
++  print_csr(CSR_E_STWEAK_PRV_LVL        , "\n");
++  print_csr(CSR_E_LTWEAK_PRV_LVL_MASK   , "  ");
++  print_csr(CSR_E_STWEAK_PRV_LVL_MASK   , "\n");
++  print_csr(CSR_E_LTWEAK_PTE_MSB        , "  ");
++  print_csr(CSR_E_STWEAK_PTE_MSB        , "\n");
++  print_csr(CSR_E_LTWEAK_PTE_MSB_MASK   , "  ");
++  print_csr(CSR_E_STWEAK_PTE_MSB_MASK   , "\n");
++  print_csr(CSR_E_LTWEAK_PTE_LSB        , "  ");
++  print_csr(CSR_E_STWEAK_PTE_LSB        , "\n");
++  print_csr(CSR_E_LTWEAK_PTE_LSB_MASK   , "  ");
++  print_csr(CSR_E_STWEAK_PTE_LSB_MASK   , "\n");
++  print_csr(CSR_E_LTWEAK_XRANGE_MAP     , "  ");
++  print_csr(CSR_E_STWEAK_XRANGE_MAP     , "\n");
++  print_csr(CSR_E_LTWEAK_XRANGE_MAP_MASK, "  ");
++  print_csr(CSR_E_STWEAK_XRANGE_MAP_MASK, "\n");
++}
++
+ void __attribute__((noreturn)) bad_trap(uintptr_t* regs, uintptr_t dummy, uintptr_t mepc)
+ {
+-  die("machine mode: unhandlable trap %d @ %p", read_csr(mcause), mepc);
++  printm("machine mode: unhandlable trap:\n");
++
++  sm_thread_regs_t * reg_state = (sm_thread_regs_t *)(regs+1);
++  printm("ra  = %lx ", reg_state->ra);
++  printm("sp  = %lx ", reg_state->sp);
++  printm("gp  = %lx ", reg_state->gp);
++  printm("tp  = %lx ", reg_state->tp);
++  printm("\n");
++  printm("t0  = %lx ", reg_state->t0);
++  printm("t1  = %lx ", reg_state->t1);
++  printm("t2  = %lx ", reg_state->t2);
++  printm("s0  = %lx ", reg_state->s0);
++  printm("\n");
++  printm("s1  = %lx ", reg_state->s1);
++  printm("a0  = %lx ", reg_state->a0);
++  printm("a1  = %lx ", reg_state->a1);
++  printm("a2  = %lx ", reg_state->a2);
++  printm("\n");
++  printm("a3  = %lx ", reg_state->a3);
++  printm("a4  = %lx ", reg_state->a4);
++  printm("a5  = %lx ", reg_state->a5);
++  printm("a6  = %lx ", reg_state->a6);
++  printm("\n");
++  printm("a7  = %lx ", reg_state->a7);
++  printm("s2  = %lx ", reg_state->s2);
++  printm("s3  = %lx ", reg_state->s3);
++  printm("s4  = %lx ", reg_state->s4);
++  printm("\n");
++  printm("s5  = %lx ", reg_state->s5);
++  printm("s6  = %lx ", reg_state->s6);
++  printm("s7  = %lx ", reg_state->s7);
++  printm("s8  = %lx ", reg_state->s8);
++  printm("\n");
++  printm("s9  = %lx ", reg_state->s9);
++  printm("s10 = %lx ", reg_state->s10);
++  printm("s11 = %lx ", reg_state->s11);
++  printm("t3  = %lx ", reg_state->t3);
++  printm("\n");
++  printm("t4  = %lx ", reg_state->t4);
++  printm("t5  = %lx ", reg_state->t5);
++  printm("t6  = %lx ", reg_state->t6);
++  printm("\n");
++
++  printm("mepc = 0x%16lx\n", read_csr(mepc));
++  printm("sepc = 0x%16lx\n", read_csr(sepc));
++
++  _print_e_csrs();
++
++  printm("cause = %d, %s\n", read_csr(mcause), _cause_to_str(read_csr(mcause)));
++  printm("mtval = 0x%lx\n", read_csr(mtval));
++  printm("pc    = 0x%lx\n", mepc);
++  die("");
+ }
+ 
+ static uintptr_t mcall_console_putchar(uint8_t ch)
+ {
+-  if (uart) {
++  if (uart_lite) {
++    uart_lite_putchar(ch);
++  } else if (uart) {
+     uart_putchar(ch);
+   } else if (uart16550) {
+     uart16550_putchar(ch);
++  } else if (uart16750) {
++    uart16750_putchar(ch);
+   } else if (htif) {
+     htif_console_putchar(ch);
+   }
+@@ -58,17 +171,22 @@ void printm(const char* s, ...)
+ static void send_ipi(uintptr_t recipient, int event)
+ {
+   if (((disabled_hart_mask >> recipient) & 1)) return;
+-  atomic_or(&OTHER_HLS(recipient)->mipi_pending, event);
++  // atomic or
++  atomic_binop(&OTHER_HLS(recipient)->mipi_pending, event, res | (event));
+   mb();
+   *OTHER_HLS(recipient)->ipi = 1;
+ }
+ 
+ static uintptr_t mcall_console_getchar()
+ {
+-  if (uart) {
++  if (uart_lite) {
++    return uart_lite_getchar();
++  } else if (uart) {
+     return uart_getchar();
+   } else if (uart16550) {
+     return uart16550_getchar();
++  } else if (uart16750) {
++    return uart16750_getchar();
+   } else if (htif) {
+     return htif_console_getchar();
+   } else {
+@@ -96,7 +214,7 @@ static uintptr_t mcall_set_timer(uint64_t when)
+ 
+ static void send_ipi_many(uintptr_t* pmask, int event)
+ {
+-  _Static_assert(MAX_HARTS <= 8 * sizeof(*pmask), "# harts > uintptr_t bits");
++  _Static_assert(MAX_HARTS <= 16 * sizeof(*pmask), "# harts > uintptr_t bits");
+   uintptr_t mask = hart_mask;
+   if (pmask)
+     mask &= load_uintptr_t(pmask, read_csr(mepc));
+@@ -115,7 +233,7 @@ static void send_ipi_many(uintptr_t* pmask, int event)
+   for (uintptr_t i = 0, m = mask; m; i++, m >>= 1)
+     if (m & 1)
+       while (*OTHER_HLS(i)->ipi)
+-        incoming_ipi |= atomic_swap(HLS()->ipi, 0);
++        incoming_ipi |= atomic_binop(HLS()->ipi, 0, (0)); // atomic swap
+ 
+   // if we got an IPI, restore it; it will be taken after returning
+   if (incoming_ipi) {
+@@ -173,6 +291,16 @@ send_ipi:
+ 
+ void redirect_trap(uintptr_t epc, uintptr_t mstatus, uintptr_t badaddr)
+ {
++#if DEBUG_SM == 1
++  printm("\tredirect_trap(epc = 0x%lx, mstatus = 0x%lx, badaddr = 0x%lx)\n", epc, mstatus, badaddr);
++  printm("\tbadaddr      = 0x%lx\n", badaddr);
++  printm("\tmepc         = 0x%lx\n", read_csr(mepc));
++  printm("\tsepc         = 0x%lx\n", read_csr(sepc));
++  printm("\tepc          = 0x%lx\n", epc);
++  printm("\tscause       = 0x%lx\n", read_csr(scause));
++  printm("\tmcause       = 0x%lx\n", read_csr(mcause));
++#endif
++
+   write_csr(sbadaddr, badaddr);
+   write_csr(sepc, epc);
+   write_csr(scause, read_csr(mcause));
+@@ -184,6 +312,9 @@ void redirect_trap(uintptr_t epc, uintptr_t mstatus, uintptr_t badaddr)
+   new_mstatus |= (mstatus / (mpp_s / MSTATUS_SPP)) & MSTATUS_SPP;
+   new_mstatus |= mpp_s;
+   write_csr(mstatus, new_mstatus);
++#if DEBUG_SM == 1
++  printm("\tnew_mstatus  = 0x%lx\n", new_mstatus);
++#endif
+ 
+   extern void __redirect_trap();
+   return __redirect_trap();
+@@ -196,11 +327,36 @@ void pmp_trap(uintptr_t* regs, uintptr_t mcause, uintptr_t mepc)
+ 
+ static void machine_page_fault(uintptr_t* regs, uintptr_t mcause, uintptr_t mepc)
+ {
++#if DEBUG_SM == 1
++  printm("machine_page_fault: __is_in_smcall = %d\n", __is_in_smcall);
++  printm("\tMSTATUS_MPRV = %d\n", read_csr(mstatus) & MSTATUS_MPRV ? 1 : 0);
++  printm("\tmstatus      = 0x%lx\n", read_csr(mstatus));
++  printm("\t__sm_mstatus = 0x%lx\n", __sm_mstatus);
++#endif
+   // MPRV=1 iff this trap occurred while emulating an instruction on behalf
+   // of a lower privilege level. In that case, a2=epc and a3=mstatus.
+   // a1 holds MPRV if emulating a load or store, or MPRV | MXR if loading
+   // an instruction from memory.  In the latter case, we should report an
+   // instruction fault instead of a load fault.
++  // regs[11] = a1 (mstatus_adjust)
++  // regs[12] = a2 (epc)
++  // regs[13] = a3 (mstatus)
++  if(__is_in_smcall){ //TODO __is_in_smcall is not thread safe
++    //First we need to reset the tweak override to make sure we can do proper virtual accesses again 
++    setloadtweak_complete(E_TWEAK_CLEAR /* & ~E_LSTWEAK_TWEAK_ENABLE*/);
++    setstoretweak_complete(E_TWEAK_CLEAR /* & ~E_LSTWEAK_TWEAK_ENABLE*/);
++    //If we had a page fault during reading/writing to virtual memory
++    //then MSTATUS_MPRV was set. In this case, we make the code below think 
++    //that we came from an emulated instruction and set a1,a2,a3 as it is done 
++    //in unrpivileged_memory.h.
++    //That way, we can redirect the trap to the OS, which handles the page fault.
++    //Then we go back to the user code (__sm_mepc) and trap into the sm again.
++    if(read_csr(mstatus) & MSTATUS_MPRV){
++      regs[11] = MSTATUS_MPRV;
++      regs[12] = __sm_mepc;
++      regs[13] = __sm_mstatus;
++    }
++  }
+   if (read_csr(mstatus) & MSTATUS_MPRV) {
+     if (regs[11] == (MSTATUS_MPRV | MSTATUS_MXR)) {
+       if (mcause == CAUSE_LOAD_PAGE_FAULT)
+diff --git a/machine/mtrap.h b/machine/mtrap.h
+index 74520c5..589ebfe 100644
+--- a/machine/mtrap.h
++++ b/machine/mtrap.h
+@@ -6,7 +6,7 @@
+ #include "encoding.h"
+ 
+ #ifdef __riscv_atomic
+-# define MAX_HARTS 8 // arbitrary
++# define MAX_HARTS 16 // arbitrary
+ #else
+ # define MAX_HARTS 1
+ #endif
+@@ -50,11 +50,11 @@ typedef struct {
+ 
+ #define MACHINE_STACK_TOP() ({ \
+   register uintptr_t sp asm ("sp"); \
+-  (void*)((sp + RISCV_PGSIZE) & -RISCV_PGSIZE); })
++  (void*)((sp + MACHINE_STACK_SIZE) & -MACHINE_STACK_SIZE); })
+ 
+ // hart-local storage, at top of stack
+ #define HLS() ((hls_t*)(MACHINE_STACK_TOP() - HLS_SIZE))
+-#define OTHER_HLS(id) ((hls_t*)((void*)HLS() + RISCV_PGSIZE * ((id) - read_const_csr(mhartid))))
++#define OTHER_HLS(id) ((hls_t*)((void*)HLS() + MACHINE_STACK_SIZE * ((id) - read_const_csr(mhartid))))
+ 
+ hls_t* hls_init(uintptr_t hart_id);
+ void parse_config_string();
+@@ -78,6 +78,43 @@ static inline void wfi()
+   asm volatile ("wfi" ::: "memory");
+ }
+ 
++static void delegate_traps()
++{
++  printm("delegate_traps\n");
++  if (!supports_extension('S'))
++    return;
++
++#define MIP_STIP            (1 << IRQ_S_TIMER)
++
++  uintptr_t interrupts = MIP_SSIP | MIP_STIP | MIP_SEIP;
++  uintptr_t exceptions =
++    (1U << CAUSE_MISALIGNED_FETCH) |
++    (1U << CAUSE_FETCH_PAGE_FAULT) |
++    (1U << CAUSE_BREAKPOINT) |
++    (1U << CAUSE_LOAD_PAGE_FAULT) |
++    (1U << CAUSE_STORE_PAGE_FAULT) |
++    (1U << CAUSE_USER_ECALL);
++
++  write_csr(mideleg, interrupts);
++  write_csr(medeleg, exceptions);
++  assert(read_csr(mideleg) == interrupts);
++  assert(read_csr(medeleg) == exceptions);
++}
++
++static char * _cause_to_str(unsigned long mcause)
++{
++  char* cause = "???";
++  switch (mcause)
++  {
++    #define DECLARE_CAUSE(name, causeid) case causeid: cause = #name; break;
++    #include "encoding.h"
++    #undef DECLARE_CAUSE
++    default:
++      break;
++  };
++  return cause;
++}
++
+ #endif // !__ASSEMBLER__
+ 
+ #define IPI_SOFT       0x1
+diff --git a/machine/permutations.h b/machine/permutations.h
+new file mode 100644
+index 0000000..7f849df
+--- /dev/null
++++ b/machine/permutations.h
+@@ -0,0 +1,96 @@
++#ifndef PERMUTATIONS_H_
++#define PERMUTATIONS_H_
++
++typedef struct {
++  u64 x0, x1, x2, x3, x4;
++} state;
++
++#define ROTR64(x, n) (((x) >> (n)) | ((x) << (64 - (n))))
++
++#define ROUND(C)                    \
++  do {                              \
++    state t;                        \
++    s.x2 ^= C;                      \
++    s.x0 ^= s.x4;                   \
++    s.x4 ^= s.x3;                   \
++    s.x2 ^= s.x1;                   \
++    t.x0 = s.x0;                    \
++    t.x4 = s.x4;                    \
++    t.x3 = s.x3;                    \
++    t.x1 = s.x1;                    \
++    t.x2 = s.x2;                    \
++    s.x0 = t.x0 ^ ((~t.x1) & t.x2); \
++    s.x2 = t.x2 ^ ((~t.x3) & t.x4); \
++    s.x4 = t.x4 ^ ((~t.x0) & t.x1); \
++    s.x1 = t.x1 ^ ((~t.x2) & t.x3); \
++    s.x3 = t.x3 ^ ((~t.x4) & t.x0); \
++    s.x1 ^= s.x0;                   \
++    t.x1 = s.x1;                    \
++    s.x1 = ROTR64(s.x1, 39);        \
++    s.x3 ^= s.x2;                   \
++    t.x2 = s.x2;                    \
++    s.x2 = ROTR64(s.x2, 1);         \
++    t.x4 = s.x4;                    \
++    t.x2 ^= s.x2;                   \
++    s.x2 = ROTR64(s.x2, 6 - 1);     \
++    t.x3 = s.x3;                    \
++    t.x1 ^= s.x1;                   \
++    s.x3 = ROTR64(s.x3, 10);        \
++    s.x0 ^= s.x4;                   \
++    s.x4 = ROTR64(s.x4, 7);         \
++    t.x3 ^= s.x3;                   \
++    s.x2 ^= t.x2;                   \
++    s.x1 = ROTR64(s.x1, 61 - 39);   \
++    t.x0 = s.x0;                    \
++    s.x2 = ~s.x2;                   \
++    s.x3 = ROTR64(s.x3, 17 - 10);   \
++    t.x4 ^= s.x4;                   \
++    s.x4 = ROTR64(s.x4, 41 - 7);    \
++    s.x3 ^= t.x3;                   \
++    s.x1 ^= t.x1;                   \
++    s.x0 = ROTR64(s.x0, 19);        \
++    s.x4 ^= t.x4;                   \
++    t.x0 ^= s.x0;                   \
++    s.x0 = ROTR64(s.x0, 28 - 19);   \
++    s.x0 ^= t.x0;                   \
++  } while (0)
++
++#define P12()    \
++  do {           \
++    ROUND(0xf0); \
++    ROUND(0xe1); \
++    ROUND(0xd2); \
++    ROUND(0xc3); \
++    ROUND(0xb4); \
++    ROUND(0xa5); \
++    ROUND(0x96); \
++    ROUND(0x87); \
++    ROUND(0x78); \
++    ROUND(0x69); \
++    ROUND(0x5a); \
++    ROUND(0x4b); \
++  } while (0)
++
++#define P8()     \
++  do {           \
++    ROUND(0xb4); \
++    ROUND(0xa5); \
++    ROUND(0x96); \
++    ROUND(0x87); \
++    ROUND(0x78); \
++    ROUND(0x69); \
++    ROUND(0x5a); \
++    ROUND(0x4b); \
++  } while (0)
++
++#define P6()     \
++  do {           \
++    ROUND(0x96); \
++    ROUND(0x87); \
++    ROUND(0x78); \
++    ROUND(0x69); \
++    ROUND(0x5a); \
++    ROUND(0x4b); \
++  } while (0)
++
++#endif /* PERMUTATIONS_H_ */
+diff --git a/machine/sm.c b/machine/sm.c
+new file mode 100644
+index 0000000..49e0f28
+--- /dev/null
++++ b/machine/sm.c
+@@ -0,0 +1,650 @@
++#include "sm.h"
++#include <string.h>
++
++static uint64_t sm_rtid_previous = 0;
++static uint64_t sm_cpu_key = 0xFEDCBA9876543210; //TODO different for each CPU. initialized at first boot or whenever M-mode decides to update it
++
++
++int __is_in_smcall = 0; //TODO move to stack, because threads
++uint64_t __sm_mepc = 0; //TODO thread unsafe
++uint64_t __sm_mstatus = 0; //TODO thread unsafe
++
++uint64_t do_flush = 0;
++
++//------------------------------------------------------------------------------
++static inline void _disable_enclave_and_wipe_regs_related_to_encryption() {
++    //This function is to be used when exiting an encalve (and also for interrupts)
++
++    //reset enclave CSRs
++    CSRW(CSR_E_URANGE_VBASE , 0);
++    CSRW(CSR_E_URANGE_VSIZE , 0);
++    //CSRW(CSR_E_SRANGE_VBASE , 0); // currently unused
++    //CSRW(CSR_E_SRANGE_VSIZE , 0); // currently unused
++    CSRW(CSR_E_MRANGE_VBASE , 0);
++    CSRW(CSR_E_MRANGE_VSIZE , 0);
++    CSRW(CSR_E_SECS         , 0);
++    CSRW(CSR_E_TCS          , 0);
++    CSRW(CSR_E_USID_0       , 0);
++    CSRW(CSR_E_USID_1       , 0);
++    //CSRW(CSR_E_SSID_0       , 0); // currently unused
++    //CSRW(CSR_E_SSID_1       , 0); // currently unused
++    CSRW(CSR_E_MSID_0       , 0);
++    CSRW(CSR_E_MSID_1       , 0);
++    CSRW(CSR_E_STATUS       , 0);
++}
++
++static inline void _backup_enclave_regs_that_would_be_wiped(sm_tcs_t * tcs) {
++    //Note: mrange/MSIDs/SECS/TCS are recovered from secs/tcs page
++
++    setstoretweak_complete(E_TWEAK_ENCLAVE & ~E_LSTWEAK_TWEAK_ENABLE);
++
++    //SIDs
++    tweakstorefast_uint64_t(&(tcs->e_csrs.sesskeyl_aka_usid0), CSRR(CSR_E_USID_0));
++    tweakstorefast_uint64_t(&(tcs->e_csrs.sesskeyh_aka_usid1), CSRR(CSR_E_USID_1));
++    //tweakstorefast_uint64_t(&(tcs->e_csrs.ssid0), CSRR(CSR_E_SSID_0)); // currently unused
++    //tweakstorefast_uint64_t(&(tcs->e_csrs.ssid1), CSRR(CSR_E_SSID_1)); // currently unused
++
++    //ranges:
++    //tweakstorefast_uint64_t(&(tcs->e_csrs.srange_vbase), CSRR(CSR_E_SRANGE_VBASE)); // currently unused
++    //tweakstorefast_uint64_t(&(tcs->e_csrs.srange_vsize), CSRR(CSR_E_SRANGE_VSIZE)); // currently unused
++    tweakstorefast_uint64_t(&(tcs->e_csrs.urange_vbase), CSRR(CSR_E_URANGE_VBASE));
++    tweakstorefast_uint64_t(&(tcs->e_csrs.urange_vsize), CSRR(CSR_E_URANGE_VSIZE));
++}
++//------------------------------------------------------------------------------
++
++#ifdef SM_INTERRUPT_HANDLING
++#error "Error: SM_INTERRUPT_HANDLING is not yet implemented"
++#endif
++//------------------------------------------------------------------------------
++
++#ifdef SM_INTERRUPT_HANDLING
++static inline void _disable_interrupt_delegation(){
++    uintptr_t interrupts = MIP_SSIP | MIP_STIP | MIP_SEIP;
++    interrupts = 0;
++    printsm_debug("changing mideleg from %lx to %lx\n", CSRR(CSR_MIDELEG), interrupts);
++    CSRW(CSR_MIDELEG, interrupts);
++}
++
++static inline void _enable_interrupt_delegation(){
++    uintptr_t interrupts = MIP_SSIP | MIP_STIP | MIP_SEIP;
++    printsm_debug("changing mideleg from %lx to %lx\n", CSRR(CSR_MIDELEG), interrupts);
++    CSRW(CSR_MIDELEG, interrupts);
++}
++
++void interrupt_trap(uintptr_t* regs, uintptr_t mcause, uintptr_t mepc)
++{
++    mcause = mcause - 16; //see mtrap.S
++    if(!CSRR(CSR_E_STATUS)){
++        assert(0);
++    }
++    printsm_debug("interrupt_trap inside enclave. mcause = %d = %s. mepc = 0x%lx. mbadaddr = 0x%lx.\n", mcause, _cause_to_str(mcause), mepc, read_csr(mbadaddr));
++    printsm_debug();
++
++    setstoretweak_complete(E_TWEAK_ENCLAVE & ~E_LSTWEAK_TWEAK_ENABLE);
++    setloadtweak_complete(E_TWEAK_ENCLAVE & ~E_LSTWEAK_TWEAK_ENABLE);
++
++    sm_tcs_t *  tcs  = (sm_tcs_t *) CSRR(CSR_E_TCS);
++
++    //backup all registers to the TCS
++    tweak_memcpy_from_sm((uint64_t*)regs, (uint64_t*)&(tcs->regs_enclave), sizeof(sm_thread_regs_t), E_TWEAK_MONITOR);
++    //restore non-enclave registers
++    tweak_memcpy_to_sm((uint64_t*)&(tcs->regs_non_enclave), (uint64_t*)regs, sizeof(sm_thread_regs_t), E_TWEAK_MONITOR);
++
++    //remember interrupted mepc (and restore at eenter)
++    uint64_t mepc_eenter = tweakloadfast_uint64_t(&(tcs->mepc_eenter));
++    tweakstorefast_uint64_t(&(tcs->mepc_interrupt), mepc);
++    //change mepc to eenter /where we can then restore this state)
++    CSRW(CSR_MEPC, mepc_eenter); //or (also) SEPC?
++
++    //exit enclave (but remember enclave-specific CSRs first)
++    _backup_enclave_regs_that_would_be_wiped(tcs);
++    _disable_enclave_and_wipe_regs_related_to_encryption();
++
++    //re-enable interrupt delegation such that the interrupt traps to the OS
++    _enable_interrupt_delegation();
++
++end:
++    // Simply clear MTIE and raise STIP
++    // this converts a IRQ_M_TIMER to a IRQ_S_TIMER
++    asm volatile(
++        "csrc mie, %0;"
++        "csrs mip, %1;"
++        : /* out */
++        : "r"(MIP_MTIP), "r"(MIP_STIP) /* in */
++        : "a0"
++    );
++    return;
++}
++#endif /* SM_INTERRUPT_HANDLING */
++//------------------------------------------------------------------------------
++
++#ifndef LOC
++uint64_t _print_csrs(){
++    printsm_debug("_print_csrs()\n");
++    printsm_debug("CSR_E_USID_0                  = 0x%16lx\n", CSRR(CSR_E_USID_0));
++    printsm_debug("CSR_E_USID_1                  = 0x%16lx\n", CSRR(CSR_E_USID_1));
++    printsm_debug("CSR_E_URANGE_VBASE            = 0x%16lx\n", CSRR(CSR_E_URANGE_VBASE));
++    printsm_debug("CSR_E_URANGE_VSIZE            = 0x%16lx\n", CSRR(CSR_E_URANGE_VSIZE));
++    printsm_debug("CSR_E_SSID_0                  = 0x%16lx\n", CSRR(CSR_E_SSID_0));
++    printsm_debug("CSR_E_SSID_1                  = 0x%16lx\n", CSRR(CSR_E_SSID_1));
++    printsm_debug("CSR_E_SRANGE_VBASE            = 0x%16lx\n", CSRR(CSR_E_SRANGE_VBASE));
++    printsm_debug("CSR_E_SRANGE_VSIZE            = 0x%16lx\n", CSRR(CSR_E_SRANGE_VSIZE));
++    printsm_debug("CSR_E_MSID_0                  = 0x%16lx\n", CSRR(CSR_E_MSID_0));
++    printsm_debug("CSR_E_MSID_1                  = 0x%16lx\n", CSRR(CSR_E_MSID_1));
++    printsm_debug("CSR_E_MRANGE_VBASE            = 0x%16lx\n", CSRR(CSR_E_MRANGE_VBASE));
++    printsm_debug("CSR_E_MRANGE_VSIZE            = 0x%16lx\n", CSRR(CSR_E_MRANGE_VSIZE));
++    printsm_debug("CSR_E_DBG_CONTROL             = 0x%16lx\n", CSRR(CSR_E_DBG_CONTROL));
++    printsm_debug("CSR_E_SECS                    = 0x%16lx\n", CSRR(CSR_E_SECS));
++    printsm_debug("CSR_E_TCS                     = 0x%16lx\n", CSRR(CSR_E_TCS));
++    printsm_debug("CSR_E_STATUS                  = 0x%16lx\n", CSRR(CSR_E_STATUS));
++    printsm_debug("CSR_E_LTWEAK                  = 0x%16lx\n", CSRR(CSR_E_LTWEAK));
++    printsm_debug("CSR_E_LTWEAK_XRANGE_MAP       = 0x%16lx\n", CSRR(CSR_E_LTWEAK_XRANGE_MAP));
++    printsm_debug("CSR_E_LTWEAK_XRANGE_MAP_MASK  = 0x%16lx\n", CSRR(CSR_E_LTWEAK_XRANGE_MAP_MASK));
++    printsm_debug("CSR_E_LTWEAK_PRV_LVL          = 0x%16lx\n", CSRR(CSR_E_LTWEAK_PRV_LVL));
++    printsm_debug("CSR_E_LTWEAK_PRV_LVL_MASK     = 0x%16lx\n", CSRR(CSR_E_LTWEAK_PRV_LVL_MASK));
++    printsm_debug("CSR_E_LTWEAK_TWEAK_EN         = 0x%16lx\n", CSRR(CSR_E_LTWEAK_TWEAK_EN));
++    printsm_debug("CSR_E_LTWEAK_PTE_MSB          = 0x%16lx\n", CSRR(CSR_E_LTWEAK_PTE_MSB));
++    printsm_debug("CSR_E_LTWEAK_PTE_MSB_MASK     = 0x%16lx\n", CSRR(CSR_E_LTWEAK_PTE_MSB_MASK));
++    printsm_debug("CSR_E_LTWEAK_PTE_LSB          = 0x%16lx\n", CSRR(CSR_E_LTWEAK_PTE_LSB));
++    printsm_debug("CSR_E_LTWEAK_PTE_LSB_MASK     = 0x%16lx\n", CSRR(CSR_E_LTWEAK_PTE_LSB_MASK));
++    printsm_debug("CSR_E_STWEAK                  = 0x%16lx\n", CSRR(CSR_E_STWEAK));
++    printsm_debug("CSR_E_STWEAK_XRANGE_MAP       = 0x%16lx\n", CSRR(CSR_E_STWEAK_XRANGE_MAP));
++    printsm_debug("CSR_E_STWEAK_XRANGE_MAP_MASK  = 0x%16lx\n", CSRR(CSR_E_STWEAK_XRANGE_MAP_MASK));
++    printsm_debug("CSR_E_STWEAK_PRV_LVL          = 0x%16lx\n", CSRR(CSR_E_STWEAK_PRV_LVL));
++    printsm_debug("CSR_E_STWEAK_PRV_LVL_MASK     = 0x%16lx\n", CSRR(CSR_E_STWEAK_PRV_LVL_MASK));
++    printsm_debug("CSR_E_STWEAK_TWEAK_EN         = 0x%16lx\n", CSRR(CSR_E_STWEAK_TWEAK_EN));
++    printsm_debug("CSR_E_STWEAK_PTE_MSB          = 0x%16lx\n", CSRR(CSR_E_STWEAK_PTE_MSB));
++    printsm_debug("CSR_E_STWEAK_PTE_MSB_MASK     = 0x%16lx\n", CSRR(CSR_E_STWEAK_PTE_MSB_MASK));
++    printsm_debug("CSR_E_STWEAK_PTE_LSB          = 0x%16lx\n", CSRR(CSR_E_STWEAK_PTE_LSB));
++    printsm_debug("CSR_E_STWEAK_PTE_LSB_MASK     = 0x%16lx\n", CSRR(CSR_E_STWEAK_PTE_LSB_MASK));
++
++    return 0;
++}
++#endif // LOC
++//------------------------------------------------------------------------------
++
++#if ENCRYPTED_E_CODE == 1
++int __attribute__((always_inline)) _load_encrypted_code(
++    void * ciphertext_to_be_decrypted, //unprotected page(s)
++    unsigned long long ciphertext_length,
++    void * plaintext_target, //must be protected to not leak data. e.g. M stack or SECS or E page
++    void * nothing
++){
++    int result = 0;
++    unsigned char nonce[CRYPTO_NPUBBYTES] = {0};
++    unsigned char key[CRYPTO_KEYBYTES] = {0};
++    unsigned long long plaintext_length = 0;
++
++    //Decrypt code
++#if DEBUG_SM == 1
++    printsm_debug("going to decrypt %p (size=0x%lx)\n", ciphertext_to_be_decrypted, ciphertext_length);
++    printsm_debug("to target %p\n", plaintext_target);
++    uint64_t timestamp_decrypt_start; __asm__ volatile ("rdcycle %0": "=r" (timestamp_decrypt_start));
++#endif
++    setloadtweak_complete(E_TWEAK_ENCLAVE & ~E_LSTWEAK_TWEAK_ENABLE); //loadtweak also needs to be set because ascon also reads from target page?
++    setstoretweak_complete(E_TWEAK_ENCLAVE & ~E_LSTWEAK_TWEAK_ENABLE);
++    result |= crypto_aead_decrypt(plaintext_target, &plaintext_length, NULL, ciphertext_to_be_decrypted, ciphertext_length, NULL, 0, nonce, key);
++#if DEBUG_SM == 1
++    uint64_t timestamp_decrypt_end; __asm__ volatile ("rdcycle %0": "=r" (timestamp_decrypt_end));
++#endif
++    assert(result == 0);
++
++
++    printsm_debug("XXX plaintext_target = %p\n", plaintext_target);
++    printsm_debug("XXX ciphertext_to_be_decrypted = %p\n", ciphertext_to_be_decrypted);
++    printsm_debug("XXX plaintext_length = %p\n", (void*)plaintext_length);
++    printsm_debug("XXX ciphertext_length = %p\n", (void*)ciphertext_length);
++
++    printsm_debug("\n");
++    printsm_debug("first decrypted code word  = 0x%lx\n", tweakloadfast_uint64_t((uint64_t*)plaintext_target));
++    printsm_debug("cycles dec = %6d\n", timestamp_decrypt_end - timestamp_decrypt_start);
++    printsm_debug("\n");
++
++    return 0;
++}
++#endif //ENCRYPTED_E_CODE
++
++
++uint64_t _encrypt_some_words(uint64_t input1, uint64_t input2, uint64_t input3, uint64_t input4){
++
++    unsigned char nonce[CRYPTO_NPUBBYTES] = {0};
++    unsigned char key[CRYPTO_KEYBYTES] = {0};
++    unsigned long long plaintext_length = 0;
++    unsigned long long out_len;
++    #define AEAD_LEN_SID_ENCLAVE (CRYPTO_ABYTES + 2*sizeof(uint64_t))
++    char output[AEAD_LEN_SID_ENCLAVE + CRYPTO_ABYTES];
++    uint64_t input[AEAD_LEN_SID_ENCLAVE/sizeof(uint64_t)];
++
++    input[0] = input1;
++    input[1] = input2;
++    input[2] = input3;
++    input[3] = input4;
++#if DEBUG_SM == 1
++    uint64_t time_sid_enclave_start; __asm__ volatile ("rdcycle %0": "=r" (time_sid_enclave_start));
++#endif
++    //NOTE: all inputs and outputs must be on the SM stack, since we do not use tweakload/store
++    int result = 0;
++    result = crypto_aead_encrypt((unsigned char*)output, &out_len, (unsigned char*)input, AEAD_LEN_SID_ENCLAVE, NULL, 0, NULL, nonce, key);
++    assert(result == 0);
++#if DEBUG_SM == 1
++    uint64_t time_sid_enclave_end; __asm__ volatile ("rdcycle %0": "=r" (time_sid_enclave_end));
++    printsm_debug("cycles sid enclave = %6d\n", time_sid_enclave_end - time_sid_enclave_start);
++#endif
++
++    return *(uint64_t*)output;
++    #undef AEAD_LEN_SID_ENCLAVE
++}
++//------------------------------------------------------------------------------
++
++uint64_t _ecreate(sm_thread_regs_t * regs){
++    printsm_debug("_ecreate()\n");
++    sm_secs_t * secs                     = (sm_secs_t*)regs->a1;
++    uint64_t encrypted_code              = regs->a2;
++    uint64_t enc_size                    = regs->a3;
++    sm_tcs_t * tcs                       = (sm_tcs_t*)regs->a4;
++    uint64_t stack                       = regs->a5;
++    uint64_t stack_size                  = regs->a6;
++    uint64_t vbase                       = regs->a7;
++
++    CSRW(CSR_E_DBG_CONTROL, CSRR(CSR_E_DBG_CONTROL) | Z_DBG_VSIZE_XRANGE_IS_SIZE_NOT_MASK_NO_ALIGNMENT);
++
++    #if ENCRYPTED_E_CODE == 1
++        uint64_t vsize = enc_size - CRYPTO_ABYTES;
++    #else
++        uint64_t vsize = enc_size;
++    #endif
++
++    printsm_debug("\tcode(enc)  = 0x%lx\n", encrypted_code);
++    printsm_debug("\tsecs       = 0x%lx\n", secs);
++    printsm_debug("\tvbase      = 0x%lx\n", vbase);
++    printsm_debug("\tenc_size   = 0x%lx\n", enc_size);
++    printsm_debug("\tvsize      = 0x%lx\n", vsize);
++    printsm_debug("\tstack      = 0x%lx\n", stack);
++    printsm_debug("\tstack_size = 0x%lx\n", stack_size);
++    printsm_debug("\ttcs        = 0x%lx\n", tcs);
++
++    uint64_t rtid = ++sm_rtid_previous; //TODO atomic or lock for all global cpu/sm data
++
++    assert(vbase);
++    assert(((uint64_t)secs & 0xFFF) == 0);
++    assert(((uint64_t)tcs & 0xFFF) == 0);
++
++    //setting all tweak-relevant csrs since we need to initialize E_TWEAK_ENCLAVE pages
++    uint64_t vbase_backup = CSRRW(CSR_E_MRANGE_VBASE, vbase);
++    uint64_t vsize_backup = CSRRW(CSR_E_MRANGE_VSIZE, vsize);
++    uint64_t rtid_backup  = CSRRW(CSR_E_MSID_0,  rtid);
++
++    sm_secs_t local_secs_struct;
++    memset(&local_secs_struct, 0, sizeof(sm_secs_t));
++    //NOTE: no need to initialize entire SECS page. only the part we're actually using (rounded up to encryption block size)
++    local_secs_struct.rtid_aka_msid0       = rtid;
++    local_secs_struct.vbase                = vbase;
++    local_secs_struct.vsize                = vsize;
++    local_secs_struct.thread_count         = 1;
++    local_secs_struct.state.state          = ESTATE_READY;
++    local_secs_struct.state.pagetype       = SM_PT_SECS;
++
++    uint64_t size_of_tcs_to_be_init = 8*8*11; // needs be be multiple of 64 bytes
++    assert_ifdebug(size_of_tcs_to_be_init >= sizeof(sm_tcs_t));
++    tweak_memset((uint64_t*)tcs, 0, size_of_tcs_to_be_init, E_TWEAK_MONITOR);
++
++    #if ENCRYPTED_E_CODE == 1
++        //initialize new enclave codepage(s)
++        tweak_memset((uint64_t*)vbase, 0, ROUND_UP_PAGE(vsize), E_TWEAK_ENCLAVE);
++        //decrypt enclave code to this newly initialized page which is now protected
++        _load_encrypted_code((void *)encrypted_code, enc_size, (void *)vbase, (void *)0);
++    #else
++        assert(vbase == encrypted_code);
++        //set enclave code to E_TWEAK_ENCLAVE in-place.
++        tweak_memcpy((uint64_t*)vbase, (uint64_t*)vbase, enc_size, E_TWEAK_UNPROTECTED_U, E_TWEAK_ENCLAVE);
++    #endif
++
++    //NOTE: set ls tweak not necessary, since we use tweak_memcpy_from_sm below and we dont load data from tcs/secs
++    //Use AEAD Tag of enclave code for sid_shcode
++    //Note: v_aead_tag is CRYPTO_ABYTES bytes long.
++    uint64_t * v_aead_tag = (uint64_t *)((char*)encrypted_code + enc_size - CRYPTO_ABYTES);
++    local_secs_struct.sid_shcode_aka_msid1 = virtualload_uint64_t(v_aead_tag);
++    local_secs_struct.sid_shcode_unused = virtualload_uint64_t(v_aead_tag + 1);
++
++
++    tweak_memcpy_from_sm((uint64_t*)&local_secs_struct, (uint64_t*)secs, sizeof(sm_secs_t), E_TWEAK_MONITOR);
++
++    assert_ifdebug((CSRR(CSR_E_STWEAK) & ~E_LSTWEAK_TWEAK_ENABLE) == (E_TWEAK_MONITOR & ~E_LSTWEAK_TWEAK_ENABLE)); //otherwise set storetweak
++
++    tweakstorefast_uint64_t((uint64_t*)&(tcs->secs), (uint64_t)secs);
++
++    //set enclave CSRs in TCS
++    //not needed since tcs->e_csrs is initalized with 0 (see above)
++
++    tweakstorefast_uint64_t(&(tcs->stack), stack);
++    tweakstorefast_uint64_t(&(tcs->stack_size), stack_size);
++    uint64_t e_sp = (uint64_t)stack + stack_size - 16*sizeof(uint64_t);
++    tweakstorefast_uint64_t(&(tcs->regs_enclave.sp), e_sp);
++
++
++    //all done, now set the TCS valid.
++    sm_type_and_tstate tstate;
++    tstate.pagetype = SM_PT_TCS;
++    tstate.state = TSTATE_READY;
++    tweakstorefast_uint64_t(&(tcs->state.as_int), tstate.as_int);
++
++    //restore CSRs such that they cannot access enclave pages anymore!
++    CSRW(CSR_E_MRANGE_VBASE, vbase_backup);
++    CSRW(CSR_E_MRANGE_VSIZE, vsize_backup);
++    CSRW(CSR_E_MSID_0, rtid_backup);
++
++    return 0;
++}
++//------------------------------------------------------------------------------
++
++uint64_t _eenter(sm_thread_regs_t * regs){
++    sm_tcs_t * tcs    = (sm_tcs_t*)regs->a1;
++    printsm_debug("_eenter()\n");
++    printsm_debug("\ttcs        = 0x%lx\n", tcs);
++
++    //set tweak for SECS/TCS
++    setloadtweak_complete(E_TWEAK_MONITOR & ~E_LSTWEAK_TWEAK_ENABLE);
++    setstoretweak_complete(E_TWEAK_MONITOR & ~E_LSTWEAK_TWEAK_ENABLE);
++
++    //Note: we're using tweakload to force encryption.
++    //      otherwise OS might be able to give us a page that doesn't have the correct page-type
++    sm_secs_t * secs = (sm_secs_t*)tweakloadfast_uint64_t((uint64_t *)&(tcs->secs));
++    assert(secs);
++    printsm_debug("\tsecs       = %lx\n", secs);
++
++    assert_ifdebug(sizeof(sm_type_and_estate) == sizeof(uint64_t));
++    assert_ifdebug(sizeof(sm_type_and_tstate) == sizeof(uint64_t));
++
++    sm_type_and_estate state     = tweakloadfast_sm_type_and_estate(&(secs->state.as_int));
++    sm_type_and_tstate tcs_state = tweakloadfast_sm_type_and_tstate(&(tcs->state.as_int));
++
++    assert(state.pagetype == SM_PT_SECS);
++    assert(state.state == ESTATE_READY);
++    assert(tcs_state.pagetype == SM_PT_TCS);
++    assert(tcs_state.state == TSTATE_READY);
++
++    uint64_t rtid                 = tweakloadfast_uint64_t(&(secs->rtid_aka_msid0));
++    uint64_t vbase                = tweakloadfast_uint64_t(&(secs->vbase));
++    uint64_t vsize                = tweakloadfast_uint64_t(&(secs->vsize));
++    uint64_t sid_shcode_aka_msid1 = tweakloadfast_uint64_t(&(secs->sid_shcode_aka_msid1));
++    uint64_t sesskeyh_aka_usid1   = tweakloadfast_uint64_t(&(tcs->e_csrs.sesskeyh_aka_usid1));
++    uint64_t sesskeyl_aka_usid0   = tweakloadfast_uint64_t(&(tcs->e_csrs.sesskeyl_aka_usid0));
++    uint64_t urange_vbase         = tweakloadfast_uint64_t(&(tcs->e_csrs.urange_vbase));
++    uint64_t urange_vsize         = tweakloadfast_uint64_t(&(tcs->e_csrs.urange_vsize));
++    
++    //set enclave CSRs
++    CSRW(CSR_E_MRANGE_VBASE  , vbase);
++    CSRW(CSR_E_MRANGE_VSIZE  , vsize);
++    CSRW(CSR_E_URANGE_VBASE  , urange_vbase);
++    CSRW(CSR_E_URANGE_VSIZE  , urange_vsize);
++    CSRW(CSR_E_USID_1        , sesskeyh_aka_usid1);
++    CSRW(CSR_E_USID_0        , sesskeyl_aka_usid0);
++    CSRW(CSR_E_MSID_0        , rtid);
++    CSRW(CSR_E_MSID_1        , sid_shcode_aka_msid1);
++    CSRW(CSR_E_SECS          , secs);
++    CSRW(CSR_E_TCS           , tcs);
++    CSRW(CSR_E_DBG_CONTROL   , CSRR(CSR_E_DBG_CONTROL) | Z_DBG_VSIZE_XRANGE_IS_SIZE_NOT_MASK_NO_ALIGNMENT);
++    CSRW(CSR_E_DBG_CONTROL   , CSRR(CSR_E_DBG_CONTROL) | Z_DBG_ALLOW_UNSAFE_CODE_FETCHES);
++    CSRW(CSR_E_STATUS        , E_STATUS_ENCLAVE_MODE_EN);
++
++    //check if it was interrupted (and then restore entire state + mepc)
++    uint64_t mepc_interrupt = tweakloadfast_uint64_t(&(tcs->mepc_interrupt));
++
++    if(!mepc_interrupt){
++        // backup all registers
++        uint64_t mepc_eenter = CSRR(CSR_MEPC);
++        printsm_debug("Remembering old mepc = %lx\n", mepc_eenter);
++        printsm_debug("Setting mepc = E entry point = %lx\n", vbase);
++
++        tweak_memcpy_from_sm((uint64_t*)regs, (uint64_t*)&(tcs->regs_non_enclave), sizeof(sm_thread_regs_t), E_TWEAK_MONITOR);
++        tweakstorefast_uint64_t((uint64_t*)&(tcs->mepc_eenter), (uint64_t)mepc_eenter);
++        CSRW(CSR_MEPC, vbase);
++
++        //switch stack
++        regs->sp = tweakloadfast_uint64_t(&(tcs->regs_enclave.sp));
++        printsm_debug("Setting new sp = %lx\n", regs->sp);
++    } else {
++        //resume where we were interupted.
++        //restore register set from earlier
++        tweak_memcpy_to_sm((uint64_t*)&(tcs->regs_enclave), (uint64_t*)regs, sizeof(sm_thread_regs_t), E_TWEAK_MONITOR);
++        //setting mepc such that we can resume where we were interrupted earlier
++        CSRW(CSR_MEPC, mepc_interrupt);
++
++        //Note: all enclave CSRs (backuped by _backup_enclave_regs_that_would_be_wiped) are already properly restored (see above)
++    }
++
++    if(do_flush){
++        flush_tlb();
++    }
++
++#ifdef SM_INTERRUPT_HANDLING
++    _disable_interrupt_delegation();
++#endif
++
++    //upon mret, we should be inside the enclave
++    return 0;
++}
++//------------------------------------------------------------------------------
++
++uint64_t _eexit(sm_thread_regs_t * regs){
++    printsm_debug("_eexit()\n");
++    uint64_t return_value = regs->a1;
++
++    //assert that we're currently in the enclave.
++    if(!CSRR(CSR_E_STATUS)){
++        return 1;
++    }
++
++    sm_tcs_t *  tcs  = (sm_tcs_t *) CSRR(CSR_E_TCS);
++    //assert(tcs);
++
++    sm_type_and_estate tcs_state = {.pagetype = SM_PT_TCS, .state = TSTATE_READY};
++    tweakstore_uint64_t(&(tcs->state.as_int), tcs_state.as_int, E_TWEAK_MONITOR); //TODO race condition with eenter?
++
++    //restore all registers from before the eenter
++    tweak_memcpy_to_sm((uint64_t*)&(tcs->regs_non_enclave), (uint64_t*)regs, sizeof(sm_thread_regs_t), E_TWEAK_MONITOR);
++
++    //at mret, jump back to after eenter
++    uint64_t new_mepc = tweakloadfast_uint64_t(&(tcs->mepc_eenter));
++    //new_mepc += 4;
++    CSRW(CSR_MEPC, new_mepc);
++    printsm_debug("Restored sp   = %lx\n", regs->sp);
++    printsm_debug("Restored mepc = %lx\n", new_mepc);
++
++    //reset enclave CSRs
++    _disable_enclave_and_wipe_regs_related_to_encryption();
++
++    if(do_flush){
++        flush_tlb();
++    }
++
++    //fix medeleg/mideleg
++#ifdef SM_INTERRUPT_HANDLING
++    _enable_interrupt_delegation();
++#endif
++
++    return return_value; //this will be stored in regs->a0 from the caller of this function
++}
++//------------------------------------------------------------------------------
++
++uint64_t _eprepare(sm_thread_regs_t * regs){
++    uint64_t vaddr = regs->a1;
++    uint64_t size  = regs->a2;
++    uint64_t type  = regs->a3;
++
++    printsm_debug("_eprepare()\n");
++    printsm_debug("\tvaddr = %lx\n", vaddr);
++    printsm_debug("\tsize  = %lx\n", size);
++    printsm_debug("\ttype  = %lx\n", type);
++
++    assert(size % PAGESIZE == 0);
++    assert(vaddr);
++    
++    uint64_t tweak = E_TWEAK_CLEAR;
++    switch (type) {
++        case E_PT_REGULAR: tweak = E_TWEAK_ENCLAVE; break;
++        case E_PT_SHDATA:  tweak = E_TWEAK_SHDATA;  break;
++        case E_PT_SHCODE:  tweak = E_TWEAK_SHCODE;  break;
++        default: assert(0); break;
++    }
++    tweak_memset((uint64_t*)vaddr, 0, size, tweak);
++
++    return 0;
++}
++//------------------------------------------------------------------------------
++
++uint64_t _emod(sm_thread_regs_t * regs){
++    uint64_t vaddr     = regs->a1;
++    uint64_t size      = regs->a2;
++    uint64_t type_old  = regs->a3;
++    uint64_t type_new  = regs->a4;
++
++    printsm_debug("_emod()\n");
++    printsm_debug("\tvaddr    = %lx\n", vaddr);
++    printsm_debug("\tsize     = %lx\n", size);
++    printsm_debug("\ttype_old = %lx\n", type_old);
++    printsm_debug("\ttype_new = %lx\n", type_new);
++
++    assert(size % PAGESIZE == 0);
++    assert(vaddr);
++
++    uint64_t tweak_old = E_TWEAK_CLEAR;
++    uint64_t tweak_new = E_TWEAK_CLEAR;
++    switch (type_old) {
++        case E_PT_UNPROTECTED: tweak_old = E_TWEAK_UNPROTECTED_U; break;
++        case E_PT_REGULAR:     tweak_old = E_TWEAK_ENCLAVE; break;
++        case E_PT_SHDATA:      tweak_old = E_TWEAK_SHDATA;  break;
++        case E_PT_SHCODE:      tweak_old = E_TWEAK_SHCODE;  break;
++        default: assert(0); break;
++    }
++    switch (type_new) {
++        case E_PT_UNPROTECTED: tweak_new = E_TWEAK_UNPROTECTED_U; break;
++        case E_PT_REGULAR:     tweak_new = E_TWEAK_ENCLAVE; break;
++        case E_PT_SHDATA:      tweak_new = E_TWEAK_SHDATA;  break;
++        case E_PT_SHCODE:      tweak_new = E_TWEAK_SHCODE;  break;
++        default: assert(0); break;
++    }
++
++    tweak_memcpy((uint64_t*)vaddr, (uint64_t*)vaddr, size, tweak_old, tweak_new);
++
++    return 0;
++}
++//------------------------------------------------------------------------------
++
++uint64_t _timerinterruptSimulated(sm_thread_regs_t * regs){
++    printsm_debug("_timerinterruptSimulated()\n");
++    //assert that we're currently in the enclave.
++    if(!CSRR(CSR_E_STATUS)){
++        return 1;
++    }
++    printsm_debug("CSR_E_STATUS = %lx\n", CSRR(CSR_E_STATUS));
++    printsm_debug("CSR_E_TCS    = %lx\n", CSRR(CSR_E_TCS));
++
++    sm_tcs_t *  tcs  = (sm_tcs_t *) CSRR(CSR_E_TCS);
++    //copy all registers to the TCS
++    tweak_memcpy_from_sm((uint64_t*)regs, (uint64_t*)&(tcs->regs_enclave), sizeof(sm_thread_regs_t), E_TWEAK_MONITOR);
++    //wipe all registers
++    memset(regs, 0x00, sizeof(sm_thread_regs_t));
++
++    //restore enclave registers
++    tweak_memcpy_to_sm((uint64_t*)&(tcs->regs_enclave), (uint64_t*)regs, sizeof(sm_thread_regs_t), E_TWEAK_MONITOR);
++
++    return 0;
++}
++//------------------------------------------------------------------------------
++
++uint64_t _null(sm_thread_regs_t * regs){
++    printsm_debug("_null()\n");
++
++    uint64_t ret = 0;
++    ret = CSRR(CSR_E_SECS);
++
++    return ret;
++}
++//------------------------------------------------------------------------------
++
++uint64_t _set_flush(sm_thread_regs_t * regs){
++    printsm_debug("_set_flush()\n");
++
++    do_flush = regs->a1;
++
++    return 0;
++}
++//------------------------------------------------------------------------------
++
++uint64_t _getsealkey(sm_thread_regs_t * regs){
++    printsm_debug("_getsealkey()\n");
++
++    //assert that we're currently in the enclave.
++    if(!CSRR(CSR_E_STATUS)){
++        return -1;
++    }
++
++    sm_secs_t * secs = (sm_secs_t *) CSRR(CSR_E_SECS);
++
++    uint64_t ret = _encrypt_some_words(
++        tweakloadfast_uint64_t(&(secs->sid_shcode_aka_msid1)),
++        tweakloadfast_uint64_t(&(secs->sid_shcode_unused)),
++        0,
++        sm_cpu_key
++    );
++
++    return ret;
++}
++//------------------------------------------------------------------------------
++
++void trap_sm_call(uintptr_t* _regs, insn_t insn, uintptr_t mcause, uintptr_t mepc, uintptr_t mstatus)
++{
++    __is_in_smcall = 1;
++    sm_thread_regs_t * regs = (sm_thread_regs_t *)(_regs+1);
++    assert_ifdebug(0 == memcmp(regs, _regs+1, sizeof(sm_thread_regs_t)));
++
++    printsm_debug("trap_sm_call(%x,%x,%x,%x,%x,%x,%x,%x)\n", regs->a0, regs->a1, regs->a2, regs->a3, regs->a4, regs->a5, regs->a6, regs->a7);
++
++    uint64_t ret = (uint64_t)-1;
++
++    __sm_mepc = mepc; //TODO pass this as argument to all functions and also to the read/write functions so we can set it to a1/a2/a3 since the exception handler in mtrap.c expects this in those registers and that way it would also be thread-safe
++    __sm_mstatus = read_csr(mstatus); //TODO thread safety, see __sm_mepc, __is_in_smcall
++
++    switch (regs->a0)
++    {
++#ifndef LOC
++        case SMCALL_PRINTCSRS:
++            ret = _print_csrs();
++            break;
++#endif
++        case SMCALL_ECREATE:
++            ret = _ecreate(regs);
++            break;
++        case SMCALL_EENTER:
++            ret = _eenter(regs);
++            break;
++        case SMCALL_EEXIT:
++            ret = _eexit(regs);
++            break;
++        case SMCALL_EPREPARE:
++            ret = _eprepare(regs);
++            break;
++        case SMCALL_EMOD:
++            ret = _emod(regs);
++            break;
++        case SMCALL_TIMERINTERRUPT:
++            ret = _timerinterruptSimulated(regs);
++            break;
++        case SMCALL_NULL:
++            ret = _null(regs);
++            break;
++        case SMCALL_EGETSEALKEY:
++            ret = _getsealkey(regs);
++            break;
++        case SMCALL_SET_FLUSH:
++            ret = _set_flush(regs);
++            break;
++        default:
++            break;
++    }
++
++    //store return value to wherever a0 was stored on the machine-mode exception stack
++    regs->a0 = ret;
++    __is_in_smcall = 0;
++}
+diff --git a/machine/sm.h b/machine/sm.h
+new file mode 100644
+index 0000000..fc46bcd
+--- /dev/null
++++ b/machine/sm.h
+@@ -0,0 +1,504 @@
++#include "unprivileged_memory.h"
++#include "mtrap.h"
++#include "emulation.h"
++#include <limits.h>
++
++#include "vm.h"
++
++#include "sm_api.h"
++#include "api.h" // ascon
++#include "crypto_aead.h" // ascon
++//------------------------------------------------------------------------------
++
++#ifdef LOC
++#else //LOC
++#define printsm_error(fmt_str, ...)  do { printm(COLOR_RED "[SM] " fmt_str COLOR_RESET, ##__VA_ARGS__); } while (0)
++#define printsm_debug(fmt_str, ...)  do { printm(COLOR_CYAN "[SM] " fmt_str COLOR_RESET, ##__VA_ARGS__); } while (0)
++#endif // LOC
++
++#if DEBUG_SM == 1
++  #define assert_ifdebug assert
++#else
++  #define assert_ifdebug
++  #undef printsm_debug
++  #define printsm_debug(fmt_str, ...) do {} while (0)
++#endif
++
++#if __riscv_xlen != 64
++#error "unsupported"
++#endif
++
++#define HERE printsm_debug("%s:%d %s\n", __FILE__, __LINE__, __FUNCTION__);
++
++extern int __is_in_smcall;
++extern uint64_t __sm_mepc;
++extern uint64_t __sm_mstatus;
++
++#define NUM_BYTES_COPY (sizeof(uint64_t) * 8)
++
++//------------------------------------------------------------------------------
++void trap_sm_call(uintptr_t* regs, uintptr_t mcause, uintptr_t mepc, uintptr_t mstatus, insn_t insn);
++//------------------------------------------------------------------------------
++
++// = ... write
++// + ... read write
++// & indicates which output operands are written to before all the input operands are consumed.
++
++static inline void setloadtweak_complete(uint64_t tweak){
++    asm volatile("csrw %1, %0\n" : : "r" (tweak), "i"(CSR_E_LTWEAK));
++}
++static inline void setstoretweak_complete(uint64_t tweak){
++    asm volatile("csrw %1, %0\n" : : "r" (tweak), "i"(CSR_E_STWEAK));
++}
++
++#define DECLARE_UNPRIVILEGED_LOAD_FUNCTION_WITH_TWEAK(type, insn)              \
++  static inline type virtualload_##type(const type* addr)                      \
++  {                                                                            \
++    register uintptr_t mstatus_adjust = MSTATUS_MPRV;                          \
++    register uintptr_t mstatus = 0;                                            \
++    type result;                                                               \
++    asm volatile (                                                             \
++      "csrrs %[__mstatus], mstatus, %[__mstatus_adjust]\n"                     \
++      #insn " %[__result], %[__addr]\n"                                        \
++      "csrw mstatus, %[__mstatus]\n"                                           \
++      : /*output*/                                                             \
++        [__mstatus] "+&r" (mstatus),                                           \
++        [__result] "=&r" (result)                                              \
++      : /* input */                                                            \
++        [__addr] "m" (*addr),                                                  \
++        [__mstatus_adjust] "r" (mstatus_adjust)                                \
++    );                                                                         \
++    return result;                                                             \
++  }                                                                            \
++  static inline type tweakloadfast_##type(const type* addr)                    \
++  {                                                                            \
++    register uintptr_t mstatus_adjust = MSTATUS_MPRV;                          \
++    register uintptr_t mstatus = 0;                                            \
++    type result;                                                               \
++    asm volatile (                                                             \
++      "csrrs %[__mstatus], mstatus, %[__mstatus_adjust]\n"                     \
++      "csrrwi zero, %[__csr_ltweak_en], 1\n"                                   \
++      #insn " %[__result], %[__addr]\n"                                        \
++      "csrrwi zero, %[__csr_ltweak_en], 0\n"                                   \
++      "csrw mstatus, %[__mstatus]\n"                                           \
++      : /*output*/                                                             \
++        [__mstatus] "+&r" (mstatus),                                           \
++        [__result] "=&r" (result)                                              \
++      : /* input */                                                            \
++        [__addr] "m" (*addr),                                                  \
++        [__mstatus_adjust] "r" (mstatus_adjust),                               \
++        [__csr_ltweak_en] "i"(CSR_E_LTWEAK_TWEAK_EN)                       \
++    );                                                                         \
++    return result;                                                             \
++  }                                                                            \
++  static inline type tweakload_##type(const type* addr, uint64_t tweak)        \
++  {                                                                            \
++    setloadtweak_complete(tweak & ~E_LSTWEAK_TWEAK_ENABLE);                    \
++    return tweakloadfast_##type(addr);                                         \
++  }
++
++#define DECLARE_UNPRIVILEGED_STORE_FUNCTION_WITH_TWEAK(type, insn)             \
++  static inline void virtualstore_##type(type* addr, type val)                 \
++  {                                                                            \
++    register uintptr_t mstatus_adjust = MSTATUS_MPRV;                          \
++    register uintptr_t mstatus = 0;                                            \
++    asm volatile ("csrrs %[__mstatus], mstatus, %[__mstatus_adjust]\n"         \
++                  #insn " %[__val], %[__addr]\n"                               \
++                  "csrw mstatus, %[__mstatus]\n"                               \
++                  : /* output */                                               \
++                   [__mstatus] "+&r" (mstatus)                                 \
++                  : /* input */                                                \
++                    [__val] "r" (val),                                         \
++                    [__addr] "m" (*addr),                                      \
++                    [__mstatus_adjust] "r" (mstatus_adjust)                    \
++    );                                                                         \
++  }                                                                            \
++  static inline void tweakstorefast_##type(type* addr, type val)               \
++  {                                                                            \
++    register uintptr_t mstatus_adjust = MSTATUS_MPRV;                          \
++    register uintptr_t mstatus = 0;                                            \
++    asm volatile ("csrrs %[__mstatus], mstatus, %[__mstatus_adjust]\n"         \
++                  "csrrwi zero, %[__csr_stweak_en], 1\n"                       \
++                  #insn " %[__val], %[__addr]\n"                               \
++                  "csrrwi zero, %[__csr_stweak_en], 0\n"                       \
++                  "csrw mstatus, %[__mstatus]\n"                               \
++                  : /* output */                                               \
++                   [__mstatus] "+&r" (mstatus)                                 \
++                  : /* input */                                                \
++                    [__val] "r" (val),                                         \
++                    [__addr] "m" (*addr),                                      \
++                    [__mstatus_adjust] "r" (mstatus_adjust),                   \
++                    [__csr_stweak_en] "i"(CSR_E_STWEAK_TWEAK_EN)           \
++    );                                                                         \
++  }                                                                            \
++  static inline void tweakstore_##type(type* addr, type val, uint64_t tweak)   \
++  {                                                                            \
++    setstoretweak_complete(tweak & ~E_LSTWEAK_TWEAK_ENABLE);                   \
++    tweakstorefast_##type(addr, val);                                          \
++  }
++
++DECLARE_UNPRIVILEGED_LOAD_FUNCTION_WITH_TWEAK(uint64_t, ld)
++DECLARE_UNPRIVILEGED_STORE_FUNCTION_WITH_TWEAK(uint64_t, sd)
++DECLARE_UNPRIVILEGED_LOAD_FUNCTION_WITH_TWEAK(uint32_t, lwu)
++DECLARE_UNPRIVILEGED_LOAD_FUNCTION_WITH_TWEAK(int32_t, lw)
++DECLARE_UNPRIVILEGED_STORE_FUNCTION_WITH_TWEAK(uint32_t, sw)
++
++static inline void tweak_memcpy_to_sm(
++    uint64_t * vaddr_source, 
++    uint64_t * paddr_target, 
++    size_t length,
++    uint64_t ltweak)
++{
++    setloadtweak_complete(ltweak & ~E_LSTWEAK_TWEAK_ENABLE);
++    assert(length % NUM_BYTES_COPY == 0); //we're copying n words at a time
++    register uintptr_t __vsource        = (uintptr_t)vaddr_source;
++    register uintptr_t __ptarget        = (uintptr_t)paddr_target;
++    register uintptr_t __vsource_end    = (uintptr_t)vaddr_source + length;
++    register uintptr_t __mstatus_adjust = MSTATUS_MPRV; // not imm, because more than 5 bits
++    register uintptr_t __mstatus        = 0;
++    asm volatile (
++        "csrrwi zero, %[__csr_ltweak_en], 1\n"
++
++        "1: "
++        "csrrs %[__mstatus], mstatus, %[__mstatus_adjust]\n"
++        "ld t0, 0*8(%[__vsource])\n"
++        "ld t1, 1*8(%[__vsource])\n"
++        "ld t2, 2*8(%[__vsource])\n"
++        "ld t3, 3*8(%[__vsource])\n"
++        "ld t4, 4*8(%[__vsource])\n"
++        "ld t5, 5*8(%[__vsource])\n"
++        "ld t6, 6*8(%[__vsource])\n"
++        "ld a6, 7*8(%[__vsource])\n"
++
++        //reset mstatus
++        "csrw mstatus, %[__mstatus]\n"
++
++        "sd t0, 0*8(%[__ptarget])\n"
++        "sd t1, 1*8(%[__ptarget])\n"
++        "sd t2, 2*8(%[__ptarget])\n"
++        "sd t3, 3*8(%[__ptarget])\n"
++        "sd t4, 4*8(%[__ptarget])\n"
++        "sd t5, 5*8(%[__ptarget])\n"
++        "sd t6, 6*8(%[__ptarget])\n"
++        "sd a6, 7*8(%[__ptarget])\n"
++
++        //increment src+target and loop until src==__source_end
++        "addi %[__vsource], %[__vsource], 8*8\n"
++        "addi %[__ptarget], %[__ptarget],  8*8\n"
++        "bltu %[__vsource], %[__vsource_end], 1b\n"
++
++        //disable tweak
++        "csrrwi zero, %[__csr_ltweak_en], 0\n"
++
++        : /* output */
++          [__mstatus] "+&r" (__mstatus),
++          [__vsource] "+r"  (__vsource), 
++          [__ptarget] "+r"  (__ptarget)
++        : /* input */
++          [__vsource_end] "r" (__vsource_end), 
++          [__mstatus_adjust] "r" (__mstatus_adjust),
++          [__csr_ltweak_en] "i"(CSR_E_LTWEAK_TWEAK_EN)
++        : "t0", "t1", "t2", "t3", "t4", "t5", "t6", "a6"
++    );
++
++}
++
++static inline void tweak_memcpy_from_sm(
++    uint64_t * paddr_source, 
++    uint64_t * vaddr_target, 
++    size_t length,
++    uint64_t stweak)
++{
++    setstoretweak_complete(stweak & ~E_LSTWEAK_TWEAK_ENABLE);
++    assert(length % NUM_BYTES_COPY == 0); //we're copying n words at a time
++    
++    register uintptr_t __psource = (uintptr_t)paddr_source;
++    register uintptr_t __target = (uintptr_t)vaddr_target;
++    register uintptr_t __psource_end = (uintptr_t)paddr_source + length;
++    register uintptr_t __mstatus_adjust = MSTATUS_MPRV; // not imm, because more than 5 bits
++    register uintptr_t __mstatus = 0;
++    asm volatile (
++        "csrrwi zero, %[__csr_stweak_en], 1\n"
++
++        "1: "
++        "ld t0, 0*8(%[__psource])\n"
++        "ld t1, 1*8(%[__psource])\n"
++        "ld t2, 2*8(%[__psource])\n"
++        "ld t3, 3*8(%[__psource])\n"
++        "ld t4, 4*8(%[__psource])\n"
++        "ld t5, 5*8(%[__psource])\n"
++        "ld t6, 6*8(%[__psource])\n"
++        "ld a6, 7*8(%[__psource])\n"
++
++        "csrrs %[__mstatus], mstatus, %[__mstatus_adjust]\n"
++
++        "sd t0, 0*8(%[__target])\n"
++        "sd t1, 1*8(%[__target])\n"
++        "sd t2, 2*8(%[__target])\n"
++        "sd t3, 3*8(%[__target])\n"
++        "sd t4, 4*8(%[__target])\n"
++        "sd t5, 5*8(%[__target])\n"
++        "sd t6, 6*8(%[__target])\n"
++        "sd a6, 7*8(%[__target])\n"
++
++        //reset mstatus
++        "csrw mstatus, %[__mstatus]\n"
++
++        //increment src+target and loop until src==__source_end
++        "addi %[__psource], %[__psource], 8*8\n"
++        "addi %[__target],  %[__target],  8*8\n"
++        "bltu %[__psource], %[__psource_end], 1b\n"
++
++        //disable tweak
++        "csrrwi zero, %[__csr_stweak_en], 0\n"
++
++        : /* output */
++          [__mstatus] "+&r" (__mstatus),
++          [__psource] "+r"  (__psource), 
++          [__target]  "+r"  (__target)
++        : /* input */
++          [__psource_end] "r" (__psource_end), 
++          [__mstatus_adjust] "r" (__mstatus_adjust),
++          [__csr_stweak_en] "i"(CSR_E_STWEAK_TWEAK_EN)
++        : "t0", "t1", "t2", "t3", "t4", "t5", "t6", "a6"
++    );
++
++}
++
++static inline void tweak_memcpy(
++    uint64_t * vaddr_source, 
++    uint64_t * vaddr_target, 
++    size_t length,
++    uint64_t ltweak, 
++    uint64_t stweak)
++{
++    printsm_debug("tweak_memcpy(%p,%p,0x%x,0x%x,0x%x)\n", vaddr_source, vaddr_target, length, ltweak, stweak);
++    setloadtweak_complete(ltweak & ~E_LSTWEAK_TWEAK_ENABLE);
++    setstoretweak_complete(stweak & ~E_LSTWEAK_TWEAK_ENABLE);
++    assert(length % NUM_BYTES_COPY == 0); //we're copying n words at a time
++    register uintptr_t __source = (uintptr_t)vaddr_source;
++    register uintptr_t __target = (uintptr_t)vaddr_target;
++    register uintptr_t __source_end = (uintptr_t)vaddr_source + length;
++    register uintptr_t __mstatus_adjust = MSTATUS_MPRV; // not imm, because more than 5 bits
++    register uintptr_t __mstatus = 0;
++    register uintptr_t __tmp = 0;
++
++    asm volatile ("csrrs %[__mstatus], mstatus, %[__mstatus_adjust]\n"
++                  "csrrwi zero, %[__csr_ltweak_en], 1\n"
++                  "csrrwi zero, %[__csr_stweak_en], 1\n"
++                  //copy (double)word
++                  "1:\n"
++                  "ld %[__tmp], 0*8(%[__source])\n"
++                  "sd %[__tmp], 0*8(%[__target])\n"
++                  "ld %[__tmp], 1*8(%[__source])\n"
++                  "sd %[__tmp], 1*8(%[__target])\n"
++                  "ld %[__tmp], 2*8(%[__source])\n"
++                  "sd %[__tmp], 2*8(%[__target])\n"
++                  "ld %[__tmp], 3*8(%[__source])\n"
++                  "sd %[__tmp], 3*8(%[__target])\n"
++                  "ld %[__tmp], 4*8(%[__source])\n"
++                  "sd %[__tmp], 4*8(%[__target])\n"
++                  "ld %[__tmp], 5*8(%[__source])\n"
++                  "sd %[__tmp], 5*8(%[__target])\n"
++                  "ld %[__tmp], 6*8(%[__source])\n"
++                  "sd %[__tmp], 6*8(%[__target])\n"
++                  "ld %[__tmp], 7*8(%[__source])\n"
++                  "sd %[__tmp], 7*8(%[__target])\n"
++                  //increment src+target and loop until src==__source_end
++                  "addi %[__source], %[__source], 8*8\n"
++                  "addi %[__target], %[__target], 8*8\n"
++                  "bltu %[__source], %[__source_end], 1b\n"
++                  //disable tweaks
++                  "csrrwi zero, %[__csr_ltweak_en], 0\n"
++                  "csrrwi zero, %[__csr_stweak_en], 0\n"
++                  //reset mstatus
++                  "csrw mstatus, %[__mstatus]\n"
++                  : /* output */
++                    [__mstatus] "+&r" (__mstatus),
++                    [__tmp]     "+&r"  (__tmp),
++                    [__source]  "+r"  (__source), 
++                    [__target]  "+r"  (__target)
++                  : /* input */
++                    [__source_end] "r" (__source_end), 
++                    [__mstatus_adjust] "r" (__mstatus_adjust),
++                    [__csr_stweak_en] "i"(CSR_E_STWEAK_TWEAK_EN),
++                    [__csr_ltweak_en] "i"(CSR_E_LTWEAK_TWEAK_EN)
++    );
++}
++
++static inline void tweak_memset(
++    uint64_t * vaddr_target, 
++    uint64_t constant, 
++    size_t length,
++    uint64_t stweak)
++{
++    setstoretweak_complete(stweak & ~E_LSTWEAK_TWEAK_ENABLE);
++    assert(length % NUM_BYTES_COPY == 0); //we're copying n words at a time
++    register uintptr_t __target = (uintptr_t)vaddr_target;
++    register uintptr_t __target_end = (uintptr_t)vaddr_target + length;
++    register uintptr_t __mstatus_adjust = MSTATUS_MPRV; // not imm, because more than 5 bits
++    register uintptr_t __mstatus = 0;
++    asm volatile ("csrrs %[__mstatus], mstatus, %[__mstatus_adjust]\n"
++                  "csrrwi zero, %[__csr_stweak_en], 1\n"
++                  //set (double)word
++                  "1:\n"
++                  "sd %[__constant], 0*8(%[__target])\n"
++                  "sd %[__constant], 1*8(%[__target])\n"
++                  "sd %[__constant], 2*8(%[__target])\n"
++                  "sd %[__constant], 3*8(%[__target])\n"
++                  "sd %[__constant], 4*8(%[__target])\n"
++                  "sd %[__constant], 5*8(%[__target])\n"
++                  "sd %[__constant], 6*8(%[__target])\n"
++                  "sd %[__constant], 7*8(%[__target])\n"
++                  //increment target and loop until target == __target_end
++                  "addi %[__target], %[__target], 8*8\n"
++                  "bltu %[__target], %[__target_end], 1b\n"
++                  //disable tweaks
++                  "csrrwi zero, %[__csr_stweak_en], 0\n"
++                  //reset mstatus
++                  "csrw mstatus, %[__mstatus]\n"
++                  : /* output */
++                    [__mstatus] "+&r" (__mstatus),
++                    [__target] "+r" (__target)
++                  : /* input */
++                    [__target_end] "r" (__target_end), 
++                    [__mstatus_adjust] "r" (__mstatus_adjust),
++                    [__csr_stweak_en] "i"(CSR_E_STWEAK_TWEAK_EN),
++                    [__constant] "r"(constant)
++    );
++}
++
++//------------------------------------------------------------------------------
++
++typedef struct sm_thread_regs_t {
++    //NOTE: using the same structure and ordering as in mentry.S !
++    //normal regs:
++    uint64_t ra;
++    uint64_t sp;
++    uint64_t gp;
++    uint64_t tp;
++    uint64_t t0;
++    uint64_t t1;
++    uint64_t t2;
++    uint64_t s0;
++    uint64_t s1;
++    uint64_t a0;
++    uint64_t a1;
++    uint64_t a2;
++    uint64_t a3;
++    uint64_t a4;
++    uint64_t a5;
++    uint64_t a6;
++    uint64_t a7;
++    uint64_t s2;
++    uint64_t s3;
++    uint64_t s4;
++    uint64_t s5;
++    uint64_t s6;
++    uint64_t s7;
++    uint64_t s8;
++    uint64_t s9;
++    uint64_t s10;
++    uint64_t s11;
++    uint64_t t3;
++    uint64_t t4;
++    uint64_t t5;
++    uint64_t t6;
++    uint64_t _padding_todo_remove_maybe;
++} sm_thread_regs_t;
++
++typedef struct sm_thread_regs_float_t {
++  
++} sm_thread_regs_float_t;
++
++typedef struct sm_csrs_t {
++    uint64_t status;
++
++    uint64_t sesskeyl_aka_usid0;
++    uint64_t sesskeyh_aka_usid1;
++    uint64_t urange_vbase;
++    uint64_t urange_vsize;
++
++    char _padding[sizeof(uint64_t) * 3];
++} sm_csrs_t;
++
++typedef enum {
++    SM_INVALID = 0, // new initialized pages (are set to 0) are invalid.
++    SM_PT_SECS,
++    SM_PT_TCS
++} sm_pagetype;
++
++typedef enum {
++    ESTATE_INVALID = 0,
++    ESTATE_READY,
++    ESTATE_RUNNING,
++    ESTATE_SMCALL_PENDING
++} sm_estate;
++
++typedef enum {
++    TSTATE_INVALID = 0,
++    TSTATE_READY,
++    TSTATE_RUNNING,
++    TSTATE_SMCALL_PENDING
++} sm_tstate;
++
++typedef union{
++    struct {
++      sm_pagetype pagetype;
++      sm_tstate state;
++    };
++    uint64_t as_int;
++} sm_type_and_tstate;
++
++typedef union{
++    struct {
++      sm_pagetype pagetype;
++      sm_estate state;
++    };
++    uint64_t as_int;
++} sm_type_and_estate;
++
++typedef struct sm_secs_t {
++    sm_type_and_estate state;
++
++    uint64_t rtid_aka_msid0;
++    uint64_t sid_shcode_aka_msid1;
++    uint64_t sid_shcode_unused;
++
++    uint64_t vbase;
++    uint64_t vsize; //maybe needed for hashing the enclave code
++    uint64_t thread_count;
++    uint64_t page_count;
++} sm_secs_t;
++
++typedef struct sm_tcs_t {
++    sm_type_and_tstate state;
++    sm_secs_t * secs;
++    uint64_t stack;
++    uint64_t stack_size;
++    sm_thread_regs_t regs_enclave;
++    sm_thread_regs_t regs_non_enclave;
++
++    sm_csrs_t e_csrs;
++    uint64_t mepc_eenter; //mepc at first eenter.
++    uint64_t mepc_interrupt; //mepc at interrupt.
++
++    uint64_t do_flush;
++
++    char _padding[sizeof(uint64_t) * 6]; //to fill the struct to a multiple of NUM_BYTES_COPY bytes
++} sm_tcs_t;
++
++typedef uint64_t physical_ptr_t;
++
++#define tweakloadfast_sm_type_and_estate(addr) ({ \
++    uint64_t state_tmp = tweakloadfast_uint64_t(addr); \
++    sm_type_and_estate state = *((sm_type_and_estate*)&state_tmp); \
++    state; })
++#define tweakloadfast_sm_type_and_tstate(addr) ({ \
++    uint64_t state_tmp = tweakloadfast_uint64_t(addr); \
++    sm_type_and_tstate state = *((sm_type_and_tstate*)&state_tmp); \
++    state; })
++
++static inline void flush_tlb_page(unsigned long addr) {
++    __asm__ __volatile__ ("sfence.vma %0" : : "r" (addr) : "memory");
++}
+diff --git a/machine/sm_api.h b/machine/sm_api.h
+new file mode 100644
+index 0000000..85c7d33
+--- /dev/null
++++ b/machine/sm_api.h
+@@ -0,0 +1,76 @@
++#include <stdint.h> //for uint64_t
++
++#define SMCALL_PRINTCSRS 0
++#define SMCALL_ECREATE 1
++#define SMCALL_EINITTHREAD 2
++#define SMCALL_EENTER 3
++#define SMCALL_EEXIT 4
++#define SMCALL_EPREPARE 5
++#define SMCALL_EMOD 6
++#define SMCALL_EGETSEALKEY 7
++#define SMCALL_TIMERINTERRUPT 8
++#define SMCALL_NULL 9
++#define SMCALL_SET_FLUSH 10
++
++#define PAGESIZE 4096
++
++#define COLOR_RED     "\x1b[31m"
++#define COLOR_GREEN   "\x1b[32m"
++#define COLOR_YELLOW  "\x1b[33m"
++#define COLOR_BLUE    "\x1b[34m"
++#define COLOR_MAGENTA "\x1b[35m"
++#define COLOR_CYAN    "\x1b[36m"
++#define COLOR_RESET   "\x1b[0m"
++
++#if __riscv
++
++#define CSRR(csr_id) ({uint64_t ret; asm volatile ("csrr %0, %1" : "=r"(ret) : "i"(csr_id)); ret;})
++#define CSRRW(csr_id, val) ({uint64_t ret; asm volatile ("csrrw %0, %1, %2" : "=r"(ret) : "i"(csr_id), "r"((uint64_t)val)); ret;})
++#define CSRW(csr_id, val) do {asm volatile ("csrw %0, %1" : : "i"(csr_id), "r"((uint64_t)val));} while (0)
++
++#define READ_REG(register) ({uint64_t reg; asm volatile("mv %0, "#register : "=r"(reg)); reg;})
++
++__attribute__((always_inline)) static inline uint64_t RDTSC() {
++    uint64_t ret;
++    __asm__ volatile ("rdcycle %0": "=r" (ret));
++    return ret;
++}
++#else // not riscv
++
++    #define READ_REG(register) ({uint64_t reg; asm volatile("mov %%rsp, %0" : "=r"(reg)); reg;})
++
++    __attribute__((always_inline)) static inline uint64_t RDTSC() {
++        uint64_t a, d;
++        __asm__ volatile ("lfence");
++        __asm__ volatile ("rdtsc" : "=a" (a), "=d" (d));
++        a = (d<<32) | a;
++        __asm__ volatile ("lfence");
++        return a;
++    }
++
++#endif //riscv
++
++#define ROUND_UP_TO_POWEROFTWO(number, multiple) ((number + multiple - 1) & -multiple)
++#define ROUND_UP_PAGE(number) ROUND_UP_TO_POWEROFTWO(number, PAGESIZE)
++
++// configuration
++//#define BENCH_ENABLED    1
++#define DEBUG_SM         0
++#define DEBUG_U          1
++#define DEBUG_E          1
++#define ENCRYPTED_E_CODE 1
++#if BENCH_ENABLED == 1
++    #undef DEBUG_SM
++    #define DEBUG_SM 0
++    #undef DEBUG_E
++    #define DEBUG_E  0
++    //#undef DEBUG_U
++    //#define DEBUG_U  0
++#endif
++#ifdef LOC
++    #undef DEBUG_SM
++    #define DEBUG_SM 0
++    #undef ENCRYPTED_E_CODE
++    #define ENCRYPTED_E_CODE 0
++#endif
++
+diff --git a/machine/uart16550.c b/machine/uart16550.c
+index f4fbbee..8616ddf 100644
+--- a/machine/uart16550.c
++++ b/machine/uart16550.c
+@@ -1,45 +1,27 @@
+ // See LICENSE for license details.
+ 
+ #include <string.h>
+-#include <stdarg.h>
+-#include <assert.h>
+ #include "uart16550.h"
+ #include "fdt.h"
+ 
+ volatile uint8_t* uart16550;
+-// some devices require a shifted register index
+-// (e.g. 32 bit registers instead of 8 bit registers)
+-static uint32_t uart16550_reg_shift;
+-static uint32_t uart16550_clock = 1843200;   // a "common" base clock
+-
+-#define UART_REG_QUEUE     0    // rx/tx fifo data
+-#define UART_REG_DLL       0    // divisor latch (LSB)
+-#define UART_REG_IER       1    // interrupt enable register
+-#define UART_REG_DLM       1    // divisor latch (MSB) 
+-#define UART_REG_FCR       2    // fifo control register
+-#define UART_REG_LCR       3    // line control register
+-#define UART_REG_MCR       4    // modem control register
+-#define UART_REG_LSR       5    // line status register
+-#define UART_REG_MSR       6    // modem status register
+-#define UART_REG_SCR       7    // scratch register
++
++#define UART_REG_QUEUE     0
++#define UART_REG_LINESTAT  5
+ #define UART_REG_STATUS_RX 0x01
+ #define UART_REG_STATUS_TX 0x20
+-
+-// We cannot use the word DEFAULT for a parameter that cannot be overridden due to -Werror
+-#ifndef UART_DEFAULT_BAUD
+-#define UART_DEFAULT_BAUD  38400
+-#endif
++#define UART_REG_DLL       0
+ 
+ void uart16550_putchar(uint8_t ch)
+ {
+-  while ((uart16550[UART_REG_LSR << uart16550_reg_shift] & UART_REG_STATUS_TX) == 0);
+-  uart16550[UART_REG_QUEUE << uart16550_reg_shift] = ch;
++  while ((uart16550[UART_REG_LINESTAT] & UART_REG_STATUS_TX) == 0);
++  uart16550[UART_REG_QUEUE] = ch;
+ }
+ 
+ int uart16550_getchar()
+ {
+-  if (uart16550[UART_REG_LSR << uart16550_reg_shift] & UART_REG_STATUS_RX)
+-    return uart16550[UART_REG_QUEUE << uart16550_reg_shift];
++  if (uart16550[UART_REG_LINESTAT] & UART_REG_STATUS_RX)
++    return uart16550[UART_REG_QUEUE];
+   return -1;
+ }
+ 
+@@ -47,9 +29,7 @@ struct uart16550_scan
+ {
+   int compat;
+   uint64_t reg;
+-  uint32_t reg_offset;
+-  uint32_t reg_shift;
+-  uint32_t clock_freq;
++  uint32_t freq;
+   uint32_t baud;
+ };
+ 
+@@ -57,54 +37,39 @@ static void uart16550_open(const struct fdt_scan_node *node, void *extra)
+ {
+   struct uart16550_scan *scan = (struct uart16550_scan *)extra;
+   memset(scan, 0, sizeof(*scan));
+-  scan->baud = UART_DEFAULT_BAUD;
+ }
+ 
+ static void uart16550_prop(const struct fdt_scan_prop *prop, void *extra)
+ {
+   struct uart16550_scan *scan = (struct uart16550_scan *)extra;
+-  // For the purposes of the boot loader, the 16750 is a superset of what 16550a provides
+-  if (!strcmp(prop->name, "compatible") && ((fdt_string_list_index(prop, "ns16550a") != -1) || (fdt_string_list_index(prop, "ns16750") != -1))) {
++  if (!strcmp(prop->name, "compatible") && !strcmp((const char*)prop->value, "ns16550")) {
+     scan->compat = 1;
++  } else if (!strcmp(prop->name, "clock-frequency")) {
++    fdt_get_value(prop->value, &scan->freq);
++  } else if (!strcmp(prop->name, "current-speed")) {
++    fdt_get_value(prop->value, &scan->baud);
+   } else if (!strcmp(prop->name, "reg")) {
+     fdt_get_address(prop->node->parent, prop->value, &scan->reg);
+-  } else if (!strcmp(prop->name, "reg-shift")) {
+-    scan->reg_shift = fdt_get_value(prop, 0);
+-  } else if (!strcmp(prop->name, "reg-offset")) {
+-    scan->reg_offset = fdt_get_value(prop, 0);
+-  } else if (!strcmp(prop->name, "current-speed")) {
+-    // This is the property that Linux uses
+-    scan->baud = fdt_get_value(prop, 0);
+-  } else if (!strcmp(prop->name, "clock-frequency")) {
+-    scan->clock_freq = fdt_get_value(prop, 0);
+   }
+ }
+ 
+ static void uart16550_done(const struct fdt_scan_node *node, void *extra)
+ {
+-  uint32_t clock_freq;
+   struct uart16550_scan *scan = (struct uart16550_scan *)extra;
+   if (!scan->compat || !scan->reg || uart16550) return;
+ 
+-  if (scan->clock_freq != 0)
+-    uart16550_clock = scan->clock_freq;
+-  // if device tree doesn't supply a clock, fallback to default clock of 1843200
++  uart16550 = (void*)(uintptr_t)scan->reg;
+ 
+-  // Check for divide by zero
+-  uint32_t divisor = uart16550_clock / (16 * (scan->baud ? scan->baud : UART_DEFAULT_BAUD));
+-  // If the divisor is out of range, don't assert, set the rate back to the default
+-  if (divisor >= 0x10000u)
+-    divisor = uart16550_clock / (16 * UART_DEFAULT_BAUD);
++  // calculate divisor
++  uint32_t divisor = scan->freq / (scan->baud << 4);
+ 
+-  uart16550 = (void*)((uintptr_t)scan->reg + scan->reg_offset);
+-  uart16550_reg_shift = scan->reg_shift;
+   // http://wiki.osdev.org/Serial_Ports
+-  uart16550[UART_REG_IER << uart16550_reg_shift] = 0x00;                // Disable all interrupts
+-  uart16550[UART_REG_LCR << uart16550_reg_shift] = 0x80;                // Enable DLAB (set baud rate divisor)
+-  uart16550[UART_REG_DLL << uart16550_reg_shift] = (uint8_t)divisor;    // Set divisor (lo byte)
+-  uart16550[UART_REG_DLM << uart16550_reg_shift] = (uint8_t)(divisor >> 8);     //     (hi byte)
+-  uart16550[UART_REG_LCR << uart16550_reg_shift] = 0x03;                // 8 bits, no parity, one stop bit
+-  uart16550[UART_REG_FCR << uart16550_reg_shift] = 0xC7;                // Enable FIFO, clear them, with 14-byte threshold
++  uart16550[1] = 0x00;    // Disable all interrupts
++  uart16550[3] = 0x80;    // Enable DLAB (set baud rate divisor)
++  uart16550[0] = divisor      & 0xFF;    // divisor (lo byte) 
++  uart16550[1] = (divisor>>8) & 0xFF;    // divisor (hi byte)
++  uart16550[3] = 0x03;    // 8 bits, no parity, one stop bit
++  uart16550[2] = 0xC7;    // Enable FIFO, clear them, with 14-byte threshold
+ }
+ 
+ void query_uart16550(uintptr_t fdt)
+@@ -112,6 +77,10 @@ void query_uart16550(uintptr_t fdt)
+   struct fdt_cb cb;
+   struct uart16550_scan scan;
+ 
++  // default
++  scan.freq = 50000000;
++  scan.baud = 115200;
++
+   memset(&cb, 0, sizeof(cb));
+   cb.open = uart16550_open;
+   cb.prop = uart16550_prop;
+diff --git a/machine/uart16750.c b/machine/uart16750.c
+new file mode 100644
+index 0000000..12f8238
+--- /dev/null
++++ b/machine/uart16750.c
+@@ -0,0 +1,91 @@
++// See LICENSE for license details.
++
++#include <string.h>
++#include "uart16750.h"
++#include "fdt.h"
++
++volatile uint32_t* uart16750;
++
++#define UART_REG_QUEUE     0
++#define UART_REG_LINESTAT  5
++#define UART_REG_STATUS_RX 0x01
++#define UART_REG_STATUS_TX 0x20
++#define UART_REG_DLL       0
++
++void uart16750_putchar(uint8_t ch)
++{
++  while ((uart16750[UART_REG_LINESTAT] & UART_REG_STATUS_TX) == 0);
++  uart16750[UART_REG_QUEUE] = ch;
++}
++
++int uart16750_getchar()
++{
++  if (uart16750[UART_REG_LINESTAT] & UART_REG_STATUS_RX)
++    return uart16750[UART_REG_QUEUE];
++  return -1;
++}
++
++struct uart16750_scan
++{
++  int compat;
++  uint64_t reg;
++  uint32_t freq;
++  uint32_t baud;
++};
++
++static void uart16750_open(const struct fdt_scan_node *node, void *extra)
++{
++  struct uart16750_scan *scan = (struct uart16750_scan *)extra;
++  memset(scan, 0, sizeof(*scan));
++}
++
++static void uart16750_prop(const struct fdt_scan_prop *prop, void *extra)
++{
++  struct uart16750_scan *scan = (struct uart16750_scan *)extra;
++  if (!strcmp(prop->name, "compatible") && !strcmp((const char*)prop->value, "ns16750")) {
++    scan->compat = 1;
++  } else if (!strcmp(prop->name, "clock-frequency")) {
++    fdt_get_value(prop->value, &scan->freq);
++  } else if (!strcmp(prop->name, "current-speed")) {
++    fdt_get_value(prop->value, &scan->baud);
++  } else if (!strcmp(prop->name, "reg")) {
++    fdt_get_address(prop->node->parent, prop->value, &scan->reg);
++  }
++}
++
++static void uart16750_done(const struct fdt_scan_node *node, void *extra)
++{
++  struct uart16750_scan *scan = (struct uart16750_scan *)extra;
++  if (!scan->compat || !scan->reg || uart16750) return;
++
++  uart16750 = (void*)(uintptr_t)scan->reg;
++
++  // calculate divisor
++  uint32_t divisor = scan->freq / (scan->baud << 4);
++
++  // http://wiki.osdev.org/Serial_Ports
++  uart16750[1] = 0x00;    // Disable all interrupts
++  uart16750[3] = 0x80;    // Enable DLAB (set baud rate divisor)
++  uart16750[0] = divisor      & 0xFF;    // divisor (lo byte) 
++  uart16750[1] = (divisor>>8) & 0xFF;    // divisor (hi byte)
++  uart16750[3] = 0x03;    // 8 bits, no parity, one stop bit
++  uart16750[2] = 0xC7;    // Enable FIFO, clear them, with 14-byte threshold
++}
++
++void query_uart16750(uintptr_t fdt)
++{
++  struct fdt_cb cb;
++  struct uart16750_scan scan;
++
++  // default
++  scan.freq = 50000000;
++  scan.baud = 115200;
++
++  memset(&cb, 0, sizeof(cb));
++  cb.open = uart16750_open;
++  cb.prop = uart16750_prop;
++  cb.done = uart16750_done;
++  cb.extra = &scan;
++
++  fdt_scan(fdt, &cb);
++}
+diff --git a/machine/uart16750.h b/machine/uart16750.h
+new file mode 100644
+index 0000000..550abcd
+--- /dev/null
++++ b/machine/uart16750.h
+@@ -0,0 +1,14 @@
++// See LICENSE for license details.
++
++#ifndef _RISCV_16750_H
++#define _RISCV_16750_H
++
++#include <stdint.h>
++
++extern volatile uint32_t* uart16750;
++
++void uart16750_putchar(uint8_t ch);
++int uart16750_getchar();
++void query_uart16750(uintptr_t dtb);
++
++#endif
+diff --git a/machine/uart_lite.c b/machine/uart_lite.c
+new file mode 100644
+index 0000000..79bf662
+--- /dev/null
++++ b/machine/uart_lite.c
+@@ -0,0 +1,67 @@
++// See LICENSE for license details.
++
++#include <string.h>
++#include "uart_lite.h"
++#include "fdt.h"
++
++volatile uint32_t* uart_lite = 0;
++
++void uart_lite_putchar(uint8_t ch)
++{
++  while (uart_lite[UART_LITE_STAT_REG] & (1 << UART_LITE_TX_FULL));
++  uart_lite[UART_LITE_REG_TXFIFO] = ch;
++}
++
++int uart_lite_getchar()
++{
++  if (uart_lite[UART_LITE_STAT_REG] & (1 << UART_LITE_RX_VALID))
++    return uart_lite[UART_LITE_REG_RXFIFO];
++  return -1;
++}
++
++struct uart_lite_scan
++{
++  int compat;
++  uint64_t reg;
++};
++
++static void uart_lite_open(const struct fdt_scan_node *node, void *extra)
++{
++  struct uart_lite_scan *scan = (struct uart_lite_scan *)extra;
++  memset(scan, 0, sizeof(*scan));
++}
++
++static void uart_lite_prop(const struct fdt_scan_prop *prop, void *extra)
++{
++  struct uart_lite_scan *scan = (struct uart_lite_scan *)extra;
++  if (!strcmp(prop->name, "compatible") && !strcmp((const char*)prop->value, "xlnx,axi-uartlite-1.02.a")) {
++    scan->compat = 1;
++  } else if (!strcmp(prop->name, "reg")) {
++    fdt_get_address(prop->node->parent, prop->value, &scan->reg);
++  }
++}
++
++static void uart_lite_done(const struct fdt_scan_node *node, void *extra)
++{
++  struct uart_lite_scan *scan = (struct uart_lite_scan *)extra;
++  if (!scan->compat || !scan->reg || uart_lite) return;
++
++  uart_lite = (void*)(uintptr_t)scan->reg;
++  // https://www.xilinx.com/support/documentation/ip_documentation/axi_uartlite/v2_0/pg142-axi-uartlite.pdf
++  // clear TX and RX FIFOs
++  uart_lite[UART_LITE_CTRL_REG] = 0x3;
++}
++
++void query_uart_lite(uintptr_t fdt)
++{
++  struct fdt_cb cb;
++  struct uart_lite_scan scan;
++
++  memset(&cb, 0, sizeof(cb));
++  cb.open = uart_lite_open;
++  cb.prop = uart_lite_prop;
++  cb.done = uart_lite_done;
++  cb.extra = &scan;
++
++  fdt_scan(fdt, &cb);
++}
+diff --git a/machine/uart_lite.h b/machine/uart_lite.h
+new file mode 100644
+index 0000000..c9c9682
+--- /dev/null
++++ b/machine/uart_lite.h
+@@ -0,0 +1,24 @@
++// See LICENSE for license details.
++
++#ifndef _RISCV_UART_LITE_H
++#define _RISCV_UART_LITE_H
++
++#include <stdint.h>
++
++extern volatile uint32_t* uart_lite;
++
++#define UART_LITE_REG_RXFIFO	0
++#define UART_LITE_REG_TXFIFO    1
++#define UART_LITE_STAT_REG   	2
++#define UART_LITE_CTRL_REG  	3
++
++#define UART_LITE_TX_FULL	 3
++#define UART_LITE_RX_FULL    1
++#define UART_LITE_RX_VALID	 0
++
++
++void uart_lite_putchar(uint8_t ch);
++int uart_lite_getchar();
++void query_uart_lite(uintptr_t dtb);
++
++#endif
+diff --git a/machine/vm.h b/machine/vm.h
+index 9436ffb..d5df235 100644
+--- a/machine/vm.h
++++ b/machine/vm.h
+@@ -4,6 +4,7 @@
+ #define _VM_H
+ 
+ #include "encoding.h"
++#include <stddef.h>
+ #include <stdint.h>
+ 
+ #define MEGAPAGE_SIZE ((uintptr_t)(RISCV_PGSIZE << RISCV_PGLEVEL_BITS))
+@@ -24,7 +25,7 @@ static inline void flush_tlb()
+   asm volatile ("sfence.vma");
+ }
+ 
+-static inline pte_t pte_create(uintptr_t ppn, int type)
++static inline pte_t pte_create(uintptr_t ppn, size_t type)
+ {
+   return (ppn << PTE_PPN_SHIFT) | PTE_V | type;
+ }
+diff --git a/pk/console.c b/pk/console.c
+index ec84981..dab8aa4 100644
+--- a/pk/console.c
++++ b/pk/console.c
+@@ -3,6 +3,7 @@
+ #include "pk.h"
+ #include "file.h"
+ #include "frontend.h"
++#include "mmap.h"
+ #include <stdint.h>
+ #include <stdarg.h>
+ 
+@@ -41,6 +42,7 @@ void dump_tf(trapframe_t* tf)
+   }
+   printk("pc %lx va %lx insn       %x sr %lx\n", tf->epc, tf->badvaddr,
+          (uint32_t)tf->insn, tf->status);
++  debug_pte(tf->badvaddr);
+ }
+ 
+ void do_panic(const char* s, ...)
+diff --git a/pk/entry.S b/pk/entry.S
+index 39be286..4c0414b 100644
+--- a/pk/entry.S
++++ b/pk/entry.S
+@@ -116,3 +116,7 @@ start_user:
+ 
+   # gtfo
+   sret
++  
++  .globl start_sm
++start_sm:
++.word 0xFF
+diff --git a/pk/mmap.c b/pk/mmap.c
+index 8cdce29..9e7a7e6 100644
+--- a/pk/mmap.c
++++ b/pk/mmap.c
+@@ -7,8 +7,12 @@
+ #include "bits.h"
+ #include "mtrap.h"
+ #include <stdint.h>
++#include <limits.h>
+ #include <errno.h>
+ 
++// Ensure that sizeof(vmr_t) % 2 == 0
++// This ensures that when storing a vmr_t pointer into *pte, it does not
++// accidentally set the PTE_V bit.
+ typedef struct {
+   uintptr_t addr;
+   size_t length;
+@@ -18,6 +22,17 @@ typedef struct {
+   int prot;
+ } vmr_t;
+ 
++void debug_vmr_t(vmr_t* v) {
++  //printm("vmr_t {\n");
++  //printm("  addr = 0x%lx\n", (uintptr_t)v->addr);
++  //printm("  len  = 0x%lx\n", (uintptr_t)v->length);
++  //printm("  file = 0x%lx\n", (uintptr_t)v->file);
++  //printm("  off  = 0x%lx\n", (uintptr_t)v->offset);
++  //printm("  refc = 0x%lx\n", v->refcnt);
++  //printm("  prot = 0x%lx\n", (uintptr_t)v->prot);
++  //printm("}\n");
++}
++
+ #define MAX_VMR (RISCV_PGSIZE / sizeof(vmr_t))
+ static spinlock_t vm_lock = SPINLOCK_INIT;
+ static vmr_t* vmrs;
+@@ -52,6 +67,8 @@ static vmr_t* __vmr_alloc(uintptr_t addr, size_t length, file_t* file,
+   mb();
+ 
+   for (vmr_t* v = vmrs; v < vmrs + MAX_VMR; v++) {
++    kassert(((uintptr_t)v % 2) == 0);
++    kassert(v->refcnt >= 0);
+     if (v->refcnt == 0) {
+       if (file)
+         file_incref(file);
+@@ -67,18 +84,38 @@ static vmr_t* __vmr_alloc(uintptr_t addr, size_t length, file_t* file,
+   return NULL;
+ }
+ 
++static void __vmr_incref(vmr_t* v, unsigned inc)
++{
++  if(v->refcnt >= UINT_MAX - inc) {
++    printm("Error in __vmr_incref(inc=%d)\n", inc),
++    debug_vmr_t(v);
++    kassert(0);
++  }
++  v->refcnt += inc;
++}
++
+ static void __vmr_decref(vmr_t* v, unsigned dec)
+ {
++  if(v->refcnt < dec) {
++    printm("Error in __vmr_decref\n"),
++    debug_vmr_t(v);
++    kassert(0);
++  }
+   if ((v->refcnt -= dec) == 0)
+   {
+     if (v->file)
+       file_decref(v->file);
++    // make sure it is not accidentally used afterwards
++    memset(v, 0, sizeof(*v));
+   }
+ }
+ 
+ static size_t pte_ppn(pte_t pte)
+ {
+-  return pte >> PTE_PPN_SHIFT;
++  //mask away the uppermost reserved bits in case we use them
++  //since they are not part of the ppn.
++  size_t reserved_bits_mask = 0b1111111111ULL << 54;
++  return ((pte & ~reserved_bits_mask) >> PTE_PPN_SHIFT);
+ }
+ 
+ static uintptr_t ppn(uintptr_t addr)
+@@ -128,6 +165,24 @@ static int __va_avail(uintptr_t vaddr)
+   return pte == 0 || *pte == 0;
+ }
+ 
++pte_t debug_pte(uintptr_t addr)
++{
++  pte_t* pte = __walk(addr);
++  if (!pte) {
++    return (pte_t)-EBADF;
++  }
++  if (!*pte) {
++    return *pte;
++  }
++  if (*pte & PTE_V) {
++    return *pte;
++  } else {
++    vmr_t* v = (vmr_t*)*pte;
++    debug_vmr_t(v);
++    return (pte_t)0;
++  }
++}
++
+ static uintptr_t __vm_alloc(size_t npage)
+ {
+   uintptr_t start = current.brk, end = current.mmap_max - npage*RISCV_PGSIZE;
+@@ -148,11 +203,19 @@ static uintptr_t __vm_alloc(size_t npage)
+ static inline pte_t prot_to_type(int prot, int user)
+ {
+   pte_t pte = 0;
+-  if (prot & PROT_READ) pte |= PTE_R | PTE_A;
++  if (prot & PROT_READ)  pte |= PTE_R | PTE_A;
+   if (prot & PROT_WRITE) pte |= PTE_W | PTE_D;
+-  if (prot & PROT_EXEC) pte |= PTE_X | PTE_A;
++  if (prot & PROT_EXEC)  pte |= PTE_X | PTE_A;
+   if (pte == 0) pte = PTE_R;
+   if (user) pte |= PTE_U;
++  //Note __do_brk calls mmap with prot=-1 for some reason. this breaks
++  //create_pte because we changed int prot to size_t prot.
++
++  if (prot != -1) {
++    pte_t prot_e_msb = (((pte_t)prot & PROT_E_MASK) >> PROT_E_SHIFT) << PTE_MSB_SHIFT;
++    pte |= prot_e_msb;
++  }
++
+   return pte;
+ }
+ 
+@@ -175,9 +238,11 @@ static int __handle_page_fault(uintptr_t vaddr, int prot)
+   else if (!(*pte & PTE_V))
+   {
+     uintptr_t ppn = vpn + (first_free_paddr / RISCV_PGSIZE);
+-
++    // Since *pte is invalid, it is a pointer to vmr_t*
+     vmr_t* v = (vmr_t*)*pte;
++    // temporarily map page with read & write permissions for writing file contents
+     *pte = pte_create(ppn, prot_to_type(PROT_READ|PROT_WRITE, 0));
++    kassert((*pte & PTE_MSB) == 0);
+     flush_tlb();
+     if (v->file)
+     {
+@@ -189,13 +254,18 @@ static int __handle_page_fault(uintptr_t vaddr, int prot)
+     }
+     else
+       memset((void*)vaddr, 0, RISCV_PGSIZE);
+-    __vmr_decref(v, 1);
++    // map page with correct permissions
+     *pte = pte_create(ppn, prot_to_type(v->prot, 1));
++    kassert(*pte & PTE_V);
++    __vmr_decref(v, 1);
+   }
+ 
+   pte_t perms = pte_create(0, prot_to_type(prot, 1));
+-  if ((*pte & perms) != perms)
+-    return -1;
++  if ((*pte & perms) != perms){
++      printm("__handle_page_fault: prot bits wrong? perms = 0x%lx\n", perms);
++      printm("__handle_page_fault: prot bits wrong? pte   = 0x%lx\n", *pte);
++      return -1;
++  }
+ 
+   flush_tlb();
+   return 0;
+@@ -341,21 +411,21 @@ uintptr_t do_mprotect(uintptr_t addr, size_t length, int prot)
+       }
+   
+       if (!(*pte & PTE_V)) {
++        // PTE is invalid (bit 0 is zero). Therefore, it is a pointer to vmr_t
+         vmr_t* v = (vmr_t*)*pte;
+         if((v->prot ^ prot) & ~v->prot){
+-          //TODO:look at file to find perms
+-          res = -EACCES;
+-          break;
++          printm("TODO if((v->prot ^ prot) & ~v->prot){\n");
+         }
++
+         v->prot = prot;
+       } else {
++        // PTE is valid (bit 0 is one). Therefore, it is an actual PTE
++        // Deny mprotect on kernel pages and check that RWX protection bits aren't being elevated
+         if (!(*pte & PTE_U) ||
+             ((prot & PROT_READ) && !(*pte & PTE_R)) ||
+             ((prot & PROT_WRITE) && !(*pte & PTE_W)) ||
+             ((prot & PROT_EXEC) && !(*pte & PTE_X))) {
+-          //TODO:look at file to find perms
+-          res = -EACCES;
+-          break;
++          printm("TODO:look at file to find perms 2\n");
+         }
+         *pte = pte_create(pte_ppn(*pte), prot_to_type(prot, 1));
+       }
+diff --git a/pk/mmap.h b/pk/mmap.h
+index 0d40efd..8234c5c 100644
+--- a/pk/mmap.h
++++ b/pk/mmap.h
+@@ -33,6 +33,7 @@ int do_munmap(uintptr_t addr, size_t length);
+ uintptr_t do_mremap(uintptr_t addr, size_t old_size, size_t new_size, int flags);
+ uintptr_t do_mprotect(uintptr_t addr, size_t length, int prot);
+ uintptr_t do_brk(uintptr_t addr);
++pte_t debug_pte(uintptr_t addr);
+ 
+ #define va2pa(va) ({ uintptr_t __va = (uintptr_t)(va); \
+   extern uintptr_t first_free_paddr; \
+diff --git a/pk/pk.lds b/pk/pk.lds
+index 75af7c5..53821ad 100644
+--- a/pk/pk.lds
++++ b/pk/pk.lds
+@@ -21,7 +21,7 @@ SECTIONS
+   }
+ 
+   /* text: Program code section */
+-  .text : 
++  .text :
+   {
+     *(.text)
+     *(.text.*)
+@@ -29,7 +29,7 @@ SECTIONS
+   }
+ 
+   /* rodata: Read-only data */
+-  .rodata : 
++  .rodata :
+   {
+     *(.rdata)
+     *(.rodata)
+@@ -60,7 +60,7 @@ SECTIONS
+    _fdata = .;
+ 
+   /* data: Writable data */
+-  .data : 
++  .data :
+   {
+     *(.data)
+     *(.data.*)
+@@ -86,8 +86,9 @@ SECTIONS
+ 
+   /* bss: Uninitialized writeable data section */
+   . = .;
++  . = ALIGN(8);
+   _bss_start = .;
+-  .bss : 
++  .bss :
+   {
+     *(.bss)
+     *(.bss.*)
+@@ -95,6 +96,8 @@ SECTIONS
+     *(.gnu.linkonce.b.*)
+     *(COMMON)
+   }
++  . = ALIGN(8);
++  _bss_end = .;
+ 
+   . = ALIGN(0x1000);
+   _end = .;
+diff --git a/pk/syscall.c b/pk/syscall.c
+index 8101ec9..eeb484c 100644
+--- a/pk/syscall.c
++++ b/pk/syscall.c
+@@ -438,6 +438,14 @@ static int sys_stub_nosys()
+   return -ENOSYS;
+ }
+ 
++int sys_getpte(uintptr_t addr, pte_t* output)
++{
++  *output = debug_pte(addr);
++  return 0;
++}
++
++
++
+ long do_syscall(long a0, long a1, long a2, long a3, long a4, long a5, unsigned long n)
+ {
+   const static void* syscall_table[] = {
+@@ -489,6 +497,7 @@ long do_syscall(long a0, long a1, long a2, long a3, long a4, long a5, unsigned l
+     [SYS_set_tid_address] = sys_stub_nosys,
+     [SYS_set_robust_list] = sys_stub_nosys,
+     [SYS_madvise] = sys_stub_nosys,
++    [SYS_getpte] = sys_getpte,
+   };
+ 
+   const static void* old_syscall_table[] = {
+diff --git a/pk/syscall.h b/pk/syscall.h
+index 60355ae..19802ed 100644
+--- a/pk/syscall.h
++++ b/pk/syscall.h
+@@ -65,6 +65,8 @@
+ #define SYS_lstat 1039
+ #define SYS_time 1062
+ 
++#define SYS_getpte 244
++
+ #define IS_ERR_VALUE(x) ((unsigned long)(x) >= (unsigned long)-4096)
+ #define ERR_PTR(x) ((void*)(long)(x))
+ #define PTR_ERR(x) ((long)(x))
+diff --git a/util/string.c b/util/string.c
+index 90d7127..5910777 100644
+--- a/util/string.c
++++ b/util/string.c
+@@ -9,6 +9,21 @@
+ #pragma GCC optimize ("no-tree-loop-distribute-patterns")
+ #endif
+ 
++int memcmp(const void* s1, const void* s2, size_t n)
++{
++  const unsigned char *p1 = s1;
++  const unsigned char *p2 = s2;
++  while (n--) {
++    if ( *p1 != *p2 ) {
++      return *p1 - *p2;
++    } else {
++      p1++;
++      p2++;
++    }
++  }
++  return 0;
++}
++
+ void* memcpy(void* dest, const void* src, size_t len)
+ {
+   const char* s = src;
+-- 
+2.25.1
+

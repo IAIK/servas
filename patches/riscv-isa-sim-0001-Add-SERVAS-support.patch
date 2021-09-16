@@ -1,0 +1,2308 @@
+From 8e0c4a68d5e8cd72b56905db92a890d83e31e2f3 Mon Sep 17 00:00:00 2001
+From: Stefan Steinegger <51908919+Steinegger@users.noreply.github.com>
+Date: Fri, 20 Aug 2021 10:46:28 +0200
+Subject: [PATCH] Add SERVAS support
+
+---
+ fesvr/syscall.cc     |   2 +-
+ riscv/common.h       |  31 ++
+ riscv/encoding.h     | 255 +++++++++++++++-
+ riscv/insns/lw.h     |   2 +-
+ riscv/insns/sw.h     |   2 +-
+ riscv/interactive.cc |  68 +++++
+ riscv/mmu.cc         | 671 ++++++++++++++++++++++++++++++++++++++++---
+ riscv/mmu.h          | 177 ++++++++++--
+ riscv/processor.cc   | 430 ++++++++++++++++++++++++++-
+ riscv/processor.h    |  51 ++++
+ riscv/sim.cc         |   3 +
+ riscv/sim.h          |   1 +
+ riscv/trap.h         |   1 +
+ spike_main/spike.cc  |   4 +
+ 14 files changed, 1626 insertions(+), 72 deletions(-)
+
+diff --git a/fesvr/syscall.cc b/fesvr/syscall.cc
+index f0bdd25..e83fcf3 100644
+--- a/fesvr/syscall.cc
++++ b/fesvr/syscall.cc
+@@ -108,7 +108,7 @@ void syscall_t::handle_syscall(command_t cmd)
+   {
+     htif->exitcode = cmd.payload();
+     if (htif->exit_code())
+-      std::cerr << "*** FAILED *** (tohost = " << htif->exit_code() << ")" << std::endl;
++      std::cerr << "*** FAILED *** (tohost = " << htif->exit_code() << " = 0x" << std::hex << htif->exit_code() << std::dec << ")" << std::endl;
+     return;
+   }
+   else // proxied system call
+diff --git a/riscv/common.h b/riscv/common.h
+index 3c523d0..91d90c3 100644
+--- a/riscv/common.h
++++ b/riscv/common.h
+@@ -8,4 +8,35 @@
+ 
+ #define NOINLINE __attribute__ ((noinline))
+ 
++/////////////////////////////// DEBUG Printing stuff
++#define COLOR_RED     "\x1b[31m"
++#define COLOR_GREEN   "\x1b[32m"
++#define COLOR_YELLOW  "\x1b[33m"
++#define COLOR_BLUE    "\x1b[34m"
++#define COLOR_MAGENTA "\x1b[35m"
++#define COLOR_CYAN    "\x1b[36m"
++#define COLOR_RESET   "\x1b[0m"
++#define COLOR_INFO    COLOR_CYAN
++
++//Note: Using stderr because unbuffered.
++//Otherwise this is needed: setbuf(stdout, NULL);
++
++//#define BUFFERED
++
++#ifdef BUFFERED
++    #define FPRINTF_FD stdout
++#else
++    #define FPRINTF_FD stderr
++#endif
++
++extern size_t debug_log_level;
++//static size_t debug_log_level = 1; //set to 1, because we want to see fatal errors only
++#define ERROR_FAIL2(MESSAGE, ...) do { if(debug_log_level >=  1) { fprintf(FPRINTF_FD, COLOR_RED    "%s:%d: " MESSAGE COLOR_RESET, __FILE__, __LINE__, ##__VA_ARGS__); if(errno){perror(NULL);} } exit(EXIT_FAILURE);} while (0)
++#define ERROR_FAIL(MESSAGE, ...)  do { if(debug_log_level >=  1) { fprintf(FPRINTF_FD, COLOR_RED    "%s: " MESSAGE COLOR_RESET, __func__, ##__VA_ARGS__); if(errno){perror(NULL);} } exit(EXIT_FAILURE);} while (0)
++#define ERROR(MESSAGE, ...)       do { if(debug_log_level >=  2) { fprintf(FPRINTF_FD, COLOR_RED    "%s: " MESSAGE COLOR_RESET, __func__, ##__VA_ARGS__); }} while (0)
++#define WARNING(MESSAGE, ...)     do { if(debug_log_level >=  3) { fprintf(FPRINTF_FD, COLOR_YELLOW "%s: " MESSAGE COLOR_RESET, __func__, ##__VA_ARGS__); }} while (0)
++#define INFO(MESSAGE, ...)        do { if(debug_log_level >=  5) { fprintf(FPRINTF_FD, COLOR_INFO   "%s: " MESSAGE COLOR_RESET, __func__, ##__VA_ARGS__); }} while (0)
++#define VERBOSE(MESSAGE, ...)     do { if(debug_log_level >=  8) { fprintf(FPRINTF_FD, COLOR_CYAN   "%s: " MESSAGE COLOR_RESET, __func__, ##__VA_ARGS__); }} while (0)
++#define DEBUG(MESSAGE, ...)       do { if(debug_log_level >= 10) { fprintf(FPRINTF_FD, COLOR_CYAN   "%s: " MESSAGE COLOR_RESET, __func__, ##__VA_ARGS__); }} while (0)
++
+ #endif
+diff --git a/riscv/encoding.h b/riscv/encoding.h
+index 584bc27..7155334 100644
+--- a/riscv/encoding.h
++++ b/riscv/encoding.h
+@@ -65,6 +65,7 @@
+ #define DCSR_CAUSE_DEBUGINT 3
+ #define DCSR_CAUSE_STEP     4
+ #define DCSR_CAUSE_HALT     5
++#define DCSR_CAUSE_GROUP    6
+ 
+ #define MCONTROL_TYPE(xlen)    (0xfULL<<((xlen)-4))
+ #define MCONTROL_DMODE(xlen)   (1ULL<<((xlen)-5))
+@@ -166,7 +167,16 @@
+ #define EXT_IO_BASE        0x40000000
+ #define DRAM_BASE          0x80000000
+ 
++// Z extension Debug register values
++#define Z_DBG_AUTH_WEAK                                   0x1
++#define Z_DBG_ALLOW_UNSAFE_CODE_FETCHES                   0x2
++#define Z_DBG_VSIZE_XRANGE_IS_SIZE_NOT_MASK_NO_ALIGNMENT  0x4
++
+ /* page table entry (PTE) fields */
++/*
++* | XLEN-1   57 | 56  54 | 53  28 | 27  19 | 18  10 | 9             8 | 7 | 6 | 5 | 4 | 3 | 2 | 1 | 0
++* | reserved    | E_PT   | PPN[2]   PPN[1]   PPN[0] | reserved for SW   D   A   G   U   X   W   R   V
++*/
+ #define PTE_V     0x001 /* Valid */
+ #define PTE_R     0x002 /* Read */
+ #define PTE_W     0x004 /* Write */
+@@ -176,11 +186,94 @@
+ #define PTE_A     0x040 /* Accessed */
+ #define PTE_D     0x080 /* Dirty */
+ #define PTE_SOFT  0x300 /* Reserved for Software */
++#define PTE_LSB  (PTE_V | PTE_R | PTE_W | PTE_X | PTE_U | PTE_G | PTE_A | PTE_D | PTE_SOFT) /* Bitmask for bits lower than the PPN */
+ 
+-#define PTE_PPN_SHIFT 10
++#define PTE_MSB_SHIFT 54
++#define PTE_MSB (0x3FFULL << PTE_MSB_SHIFT)
++#define PTE_MSB_ENCRYPTED_PAGE  0x1ULL
++#define PTE_MSB_SOFT_SID0       0x2ULL
++#define PTE_MSB_SOFT_SID1       0x4ULL
++#define PTE_MSB_SOFT_SID_MASK (PTE_MSB_SOFT_SID0 | PTE_MSB_SOFT_SID1) //conveniece macro. only used for spike.
++
++// Selects which bits of the LSB are globally used as part of the tweak
++#define E_GLOBAL_PTE_LSB_CONFIG_MASK (PTE_R | PTE_W | PTE_X | PTE_U | PTE_G)
++#define E_GLOBAL_PTE_MSB_CONFIG_MASK (PTE_MSB_SOFT_SID1 | PTE_MSB_SOFT_SID0 | PTE_MSB_ENCRYPTED_PAGE) //TODO maybe (PTE_MSB >> PTE_MSB_SHIFT)
++
++#define E_XRANGE_MAP_BITSIZE 3
++#define E_XRANGE_MAP_MASK 0b111ULL
++#define E_XRANGE_MAP_MRANGE_MASK 0b100ULL
++#define E_XRANGE_MAP_SRANGE_MASK 0b010ULL
++#define E_XRANGE_MAP_URANGE_MASK 0b001ULL
++#define E_PRV_LVL_BITSIZE 2
++#define E_PRV_LVL_MASK 0b11ULL
++#define E_LSB_BITSIZE 10
++#define E_LSB_MASK 0x3FFULL
++#define E_MSB_BITSIZE 10
++#define E_MSB_MASK 0x3FFULL
++#define E_TWEAK_ENABLE_BITSIZE 1
++#define E_TWEAK_ENABLE_MASK 0x1ULL
++
++// bitmask for the E_STATUS_register
++#define E_STATUS_ENCLAVE_MODE_EN 0x1
++
++#define CONCAT12(a,b,c,d,e,f,h,i,j,k,l,m) a##b##c##d##e##f##h##i##j##k##l##m
++
++// {L,S}TWEAK :=
++// 50            48| 47       45 | 44           43 | 42      41 | 40            |   39          30   | 29        20 | 19         10 | 9       0 |
++// xrange_map_mask | xrange_map  |   prv_lvl_mask  |   prv_lvl  |  tweak_en     |    pte_msb_mask    |  pte_msb     | pte_lsb_mask  | pte_lsb   |
+ 
++// xrange_map = concatenation of is_in_mrange | is_in_srange | is_in_urange this selects which of urange/srange/mrange is selected for voffset calculation.
++// prv-lvl = current priviledge mode of the CPU.
++// If tweak_en is set, we are using all overrides from {L,S}TWEAK (depending on their masks)
++// pte_msb = highest 10 bits of PTE.
++// pte_lsb = lowest  10 bits of PTE = [SW D A G U X W R V]. Note that we're only using bits defined in E_GLOBAL_PTE_LSB_CONFIG_MASK
++
++// Values to set as store and load tweaks for the corresponding page type labels, see {L,S}TWEAK for details.
++//                                         xrange_map_mask|xrange_map|prv_lvl_mask|prv_lvl|tweak_en|pte_msb_mask|  pte_msb        |pte_lsb_mask| pte_lsb
++//                                               ___      ,    XXX   ,      __    ,   XX  ,   _    , XXXXXXXXXX , _______  __ , _ , XXXXXXXXXX ,  __________
++//                       x10                     544      ,    444   ,      44    ,   44  ,   4    , 3333333333 , 2222222  22 , 2 , 1111111111 ,  0000000000
++//                        x1                     098      ,    765   ,      43    ,   21  ,   0    , 9876543210 , 9876543  21 , 0 , 9876543210 ,  9876543210
++//masks for the individual lstweak fields:
++#define E_LSTWEAK_XRANGE_MAP_MASK CONCAT12(0b,   111      ,    000   ,      00    ,   00  ,   0    , 0000000000 , 0000000, 00 , 0 , 0000000000 , 0000000000)
++#define E_LSTWEAK_XRANGE_MAP      CONCAT12(0b,   000      ,    111   ,      00    ,   00  ,   0    , 0000000000 , 0000000, 00 , 0 , 0000000000 , 0000000000)
++#define E_LSTWEAK_PRV_LVL_MASK    CONCAT12(0b,   000      ,    000   ,      11    ,   00  ,   0    , 0000000000 , 0000000, 00 , 0 , 0000000000 , 0000000000)
++#define E_LSTWEAK_PRV_LVL         CONCAT12(0b,   000      ,    000   ,      00    ,   11  ,   0    , 0000000000 , 0000000, 00 , 0 , 0000000000 , 0000000000)
++#define E_LSTWEAK_TWEAK_ENABLE    CONCAT12(0b,   000      ,    000   ,      00    ,   00  ,   1    , 0000000000 , 0000000, 00 , 0 , 0000000000 , 0000000000)
++#define E_LSTWEAK_PTE_MSB_MASK    CONCAT12(0b,   000      ,    000   ,      00    ,   00  ,   0    , 1111111111 , 0000000, 00 , 0 , 0000000000 , 0000000000)
++#define E_LSTWEAK_PTE_MSB         CONCAT12(0b,   000      ,    000   ,      00    ,   00  ,   0    , 0000000000 , 1111111, 11 , 1 , 0000000000 , 0000000000)
++#define E_LSTWEAK_PTE_LSB_MASK    CONCAT12(0b,   000      ,    000   ,      00    ,   00  ,   0    , 0000000000 , 0000000, 00 , 0 , 1111111111 , 0000000000)
++#define E_LSTWEAK_PTE_LSB         CONCAT12(0b,   000      ,    000   ,      00    ,   00  ,   0    , 0000000000 , 0000000, 00 , 0 , 0000000000 , 1111111111)
++//predefined tweaks:
++#define E_TWEAK_CLEAR             CONCAT12(0b,   000      ,    000   ,      00    ,   00  ,   0    , 0000000000 , 0000000, 00 , 0 , 0000000000 , 0000000000)
++#define E_TWEAK_MONITOR           CONCAT12(0b,   111      ,    000   ,      11    ,   11  ,   1    , 0000000111 , 0000000, 00 , 1 , 0000000110 , 0000000110)
++#define E_TWEAK_ENCLAVE           CONCAT12(0b,   111      ,    100   ,      11    ,   00  ,   1    , 0000000111 , 0000000, 01 , 1 , 0000000000 , 0000000000)
++#define E_TWEAK_SHCODE            CONCAT12(0b,   111      ,    100   ,      11    ,   00  ,   1    , 0000000111 , 0000000, 10 , 1 , 0000000100 , 0000000000)
++#define E_TWEAK_SHDATA            CONCAT12(0b,   111      ,    001   ,      11    ,   00  ,   1    , 0000000111 , 0000000, 11 , 1 , 0000001000 , 0000000000)
++#define E_TWEAK_UNPROTECTED_U     CONCAT12(0b,   111      ,    000   ,      11    ,   00  ,   1    , 0000000111 , 0000000, 00 , 1 , 1111111111 , 0000000000)
++
++// MSB bits for the PT entries, names are to make the intended page type more obvious in code
++// Make sure to shift left by E_MSB_SHIFT if or-ing
++//NOTE: these have nothing to do with the RSW bits.
++#define E_PT_UNPROTECTED (0)
++#define E_PT_REGULAR     (                    PTE_MSB_SOFT_SID0 | PTE_MSB_ENCRYPTED_PAGE)
++#define E_PT_SHDATA      (PTE_MSB_SOFT_SID1 | PTE_MSB_SOFT_SID0 | PTE_MSB_ENCRYPTED_PAGE)
++#define E_PT_SHCODE      (PTE_MSB_SOFT_SID1 |                     PTE_MSB_ENCRYPTED_PAGE)
++#define E_PT_MONITOR     (                                        PTE_MSB_ENCRYPTED_PAGE)
++
++#define PTE_PPN_SHIFT 10
+ #define PTE_TABLE(PTE) (((PTE) & (PTE_V | PTE_R | PTE_W | PTE_X)) == PTE_V)
+ 
++//for mmap related syscalls
++//shifted by PROT_E_SHIFT to avoid conflicts with pre-existing PROT_* values used in linux (and the proxykernel)
++#define PROT_E_SHIFT       12
++#define PROT_E_MASK        (( PTE_MSB_SOFT_SID_MASK | PTE_MSB_ENCRYPTED_PAGE ) << PROT_E_SHIFT)
++#define PROT_E_MONITOR     (( E_PT_MONITOR                                   ) << PROT_E_SHIFT)
++#define PROT_E_ENCLAVE     (( E_PT_REGULAR                                   ) << PROT_E_SHIFT)
++#define PROT_E_SHCODE      (( E_PT_SHCODE                                    ) << PROT_E_SHIFT)
++#define PROT_E_SHDATA      (( E_PT_SHDATA                                    ) << PROT_E_SHIFT)
++#define PROT_E_UNPROTECTED (( E_PT_UNPROTECTED                               ) << PROT_E_SHIFT)
++
++
+ #ifdef __riscv
+ 
+ #if __riscv_xlen == 64
+@@ -196,6 +289,7 @@
+ #endif
+ #define RISCV_PGSHIFT 12
+ #define RISCV_PGSIZE (1 << RISCV_PGSHIFT)
++#define RISCV_MSTACKSIZE RISCV_PGSIZE
+ 
+ #ifndef __ASSEMBLER__
+ 
+@@ -276,6 +370,10 @@
+ #define MASK_FMV_X_S  0xfff0707f
+ #define MATCH_FMV_S_X 0xf0000053
+ #define MASK_FMV_S_X  0xfff0707f
++#define MATCH_FMV_X_Q 0xe6000053
++#define MASK_FMV_X_Q  0xfff0707f
++#define MATCH_FMV_Q_X 0xf6000053
++#define MASK_FMV_Q_X  0xfff0707f
+ #define MATCH_FENCE_TSO 0x8330000f
+ #define MASK_FENCE_TSO  0xfff0707f
+ #define MATCH_PAUSE 0x100000f
+@@ -640,10 +738,6 @@
+ #define MASK_FCVT_Q_L  0xfff0007f
+ #define MATCH_FCVT_Q_LU 0xd6300053
+ #define MASK_FCVT_Q_LU  0xfff0007f
+-#define MATCH_FMV_X_Q 0xe6000053
+-#define MASK_FMV_X_Q  0xfff0707f
+-#define MATCH_FMV_Q_X 0xf6000053
+-#define MASK_FMV_Q_X  0xfff0707f
+ #define MATCH_ECALL 0x73
+ #define MASK_ECALL  0xffffffff
+ #define MATCH_EBREAK 0x100073
+@@ -676,6 +770,8 @@
+ #define MASK_HFENCE_VVMA  0xfe007fff
+ #define MATCH_HFENCE_GVMA 0x62000073
+ #define MASK_HFENCE_GVMA  0xfe007fff
++#define MATCH_R_COUNTER_TREE 0xb
++#define MASK_R_COUNTER_TREE  0x707f
+ #define MATCH_C_NOP 0x1
+ #define MASK_C_NOP  0xffff
+ #define MATCH_C_ADDI16SP 0x6101
+@@ -1661,8 +1757,8 @@
+ #define CSR_HGATP 0x680
+ #define CSR_HGEIP 0xe12
+ #define CSR_UTVT 0x7
+-#define CSR_UNXTI 0x45
+-#define CSR_UINTSTATUS 0x46
++#define CSR_UNXTI 0xc37d
++#define CSR_UINTSTATUS 0xc766
+ #define CSR_USCRATCHCSW 0x48
+ #define CSR_USCRATCHCSWL 0x49
+ #define CSR_STVT 0x107
+@@ -1710,6 +1806,73 @@
+ #define CSR_PMPADDR13 0x3bd
+ #define CSR_PMPADDR14 0x3be
+ #define CSR_PMPADDR15 0x3bf
++#define CSR_E_SRANGE_VBASE 0x5c0
++#define CSR_E_SRANGE_VSIZE 0x5c1
++#define CSR_E_SSID_0 0x5c2
++#define CSR_E_SSID_1 0x5c3
++#define CSR_E_MRANGE_VBASE 0x7c0
++#define CSR_E_MRANGE_VSIZE 0x7c1
++#define CSR_E_MSID_0 0x7c2
++#define CSR_E_MSID_1 0x7c3
++#define CSR_E_LTWEAK 0x7c5
++#define CSR_E_LTWEAK_XRANGE_MAP 0x7c6
++#define CSR_E_LTWEAK_XRANGE_MAP_MASK 0x7c7
++#define CSR_E_LTWEAK_PRV_LVL 0x7c8
++#define CSR_E_LTWEAK_PRV_LVL_MASK 0x7c9
++#define CSR_E_LTWEAK_TWEAK_EN 0x7ca
++#define CSR_E_LTWEAK_PTE_MSB 0x7cb
++#define CSR_E_LTWEAK_PTE_MSB_MASK 0x7cc
++#define CSR_E_LTWEAK_PTE_LSB 0x7cd
++#define CSR_E_LTWEAK_PTE_LSB_MASK 0x7ce
++#define CSR_E_STWEAK 0x7cf
++#define CSR_E_STWEAK_XRANGE_MAP 0x7d0
++#define CSR_E_STWEAK_XRANGE_MAP_MASK 0x7d1
++#define CSR_E_STWEAK_PRV_LVL 0x7d2
++#define CSR_E_STWEAK_PRV_LVL_MASK 0x7d3
++#define CSR_E_STWEAK_TWEAK_EN 0x7d4
++#define CSR_E_STWEAK_PTE_MSB 0x7d5
++#define CSR_E_STWEAK_PTE_MSB_MASK 0x7d6
++#define CSR_E_STWEAK_PTE_LSB 0x7d7
++#define CSR_E_STWEAK_PTE_LSB_MASK 0x7d8
++#define CSR_E_STATUS 0x7d9
++#define CSR_E_SECS 0x7da
++#define CSR_E_TCS 0x7db
++#define CSR_E_URANGE_VBASE 0x801
++#define CSR_E_URANGE_VSIZE 0x802
++#define CSR_E_USID_0 0x803
++#define CSR_E_USID_1 0x804
++#define CSR_E_DBG_CONTROL 0x823
++#define CSR_E_DBG_MRANGE_VBASE 0x824
++#define CSR_E_DBG_MRANGE_VSIZE 0x825
++#define CSR_E_DBG_SRANGE_VBASE 0x826
++#define CSR_E_DBG_SRANGE_VSIZE 0x827
++#define CSR_E_DBG_MSID_0 0x828
++#define CSR_E_DBG_MSID_1 0x829
++#define CSR_E_DBG_SSID_0 0x82a
++#define CSR_E_DBG_SSID_1 0x82b
++#define CSR_E_DBG_LTWEAK 0x830
++#define CSR_E_DBG_LTWEAK_XRANGE_MAP 0x831
++#define CSR_E_DBG_LTWEAK_XRANGE_MAP_MASK 0x832
++#define CSR_E_DBG_LTWEAK_PRV_LVL 0x833
++#define CSR_E_DBG_LTWEAK_PRV_LVL_MASK 0x834
++#define CSR_E_DBG_LTWEAK_TWEAK_EN 0x835
++#define CSR_E_DBG_LTWEAK_PTE_MSB 0x836
++#define CSR_E_DBG_LTWEAK_PTE_MSB_MASK 0x837
++#define CSR_E_DBG_LTWEAK_PTE_LSB 0x838
++#define CSR_E_DBG_LTWEAK_PTE_LSB_MASK 0x839
++#define CSR_E_DBG_STWEAK 0x83a
++#define CSR_E_DBG_STWEAK_XRANGE_MAP 0x83b
++#define CSR_E_DBG_STWEAK_XRANGE_MAP_MASK 0x83c
++#define CSR_E_DBG_STWEAK_PRV_LVL 0x83d
++#define CSR_E_DBG_STWEAK_PRV_LVL_MASK 0x83e
++#define CSR_E_DBG_STWEAK_TWEAK_EN 0x83f
++#define CSR_E_DBG_STWEAK_PTE_MSB 0x840
++#define CSR_E_DBG_STWEAK_PTE_MSB_MASK 0x841
++#define CSR_E_DBG_STWEAK_PTE_LSB 0x842
++#define CSR_E_DBG_STWEAK_PTE_LSB_MASK 0x843
++#define CSR_E_DBG_STATUS 0x844
++#define CSR_E_DBG_SECS 0x845
++#define CSR_E_DBG_TCS 0x846
+ #define CSR_TSELECT 0x7a0
+ #define CSR_TDATA1 0x7a1
+ #define CSR_TDATA2 0x7a2
+@@ -1815,6 +1978,7 @@
+ #define CSR_HPMCOUNTER29H 0xc9d
+ #define CSR_HPMCOUNTER30H 0xc9e
+ #define CSR_HPMCOUNTER31H 0xc9f
++#define CSR_E_SESSKEYHH 0x80
+ #define CSR_MSTATUSH 0x310
+ #define CSR_MCYCLEH 0xb80
+ #define CSR_MINSTRETH 0xb82
+@@ -1847,6 +2011,7 @@
+ #define CSR_MHPMCOUNTER29H 0xb9d
+ #define CSR_MHPMCOUNTER30H 0xb9e
+ #define CSR_MHPMCOUNTER31H 0xb9f
++#define CSR_E_RTIDH 0xba0
+ #define CAUSE_MISALIGNED_FETCH 0x0
+ #define CAUSE_FETCH_ACCESS 0x1
+ #define CAUSE_ILLEGAL_INSTRUCTION 0x2
+@@ -1862,6 +2027,7 @@
+ #define CAUSE_FETCH_PAGE_FAULT 0xc
+ #define CAUSE_LOAD_PAGE_FAULT 0xd
+ #define CAUSE_STORE_PAGE_FAULT 0xf
++#define CAUSE_DECRYPTION_INTEGRITY_FAILURE 0x10
+ #endif
+ #ifdef DECLARE_INSN
+ DECLARE_INSN(slli_rv32, MATCH_SLLI_RV32, MASK_SLLI_RV32)
+@@ -1885,6 +2051,8 @@ DECLARE_INSN(scall, MATCH_SCALL, MASK_SCALL)
+ DECLARE_INSN(sbreak, MATCH_SBREAK, MASK_SBREAK)
+ DECLARE_INSN(fmv_x_s, MATCH_FMV_X_S, MASK_FMV_X_S)
+ DECLARE_INSN(fmv_s_x, MATCH_FMV_S_X, MASK_FMV_S_X)
++DECLARE_INSN(fmv_x_q, MATCH_FMV_X_Q, MASK_FMV_X_Q)
++DECLARE_INSN(fmv_q_x, MATCH_FMV_Q_X, MASK_FMV_Q_X)
+ DECLARE_INSN(fence_tso, MATCH_FENCE_TSO, MASK_FENCE_TSO)
+ DECLARE_INSN(pause, MATCH_PAUSE, MASK_PAUSE)
+ DECLARE_INSN(beq, MATCH_BEQ, MASK_BEQ)
+@@ -2067,8 +2235,6 @@ DECLARE_INSN(fcvt_l_q, MATCH_FCVT_L_Q, MASK_FCVT_L_Q)
+ DECLARE_INSN(fcvt_lu_q, MATCH_FCVT_LU_Q, MASK_FCVT_LU_Q)
+ DECLARE_INSN(fcvt_q_l, MATCH_FCVT_Q_L, MASK_FCVT_Q_L)
+ DECLARE_INSN(fcvt_q_lu, MATCH_FCVT_Q_LU, MASK_FCVT_Q_LU)
+-DECLARE_INSN(fmv_x_q, MATCH_FMV_X_Q, MASK_FMV_X_Q)
+-DECLARE_INSN(fmv_q_x, MATCH_FMV_Q_X, MASK_FMV_Q_X)
+ DECLARE_INSN(ecall, MATCH_ECALL, MASK_ECALL)
+ DECLARE_INSN(ebreak, MATCH_EBREAK, MASK_EBREAK)
+ DECLARE_INSN(uret, MATCH_URET, MASK_URET)
+@@ -2085,6 +2251,7 @@ DECLARE_INSN(csrrsi, MATCH_CSRRSI, MASK_CSRRSI)
+ DECLARE_INSN(csrrci, MATCH_CSRRCI, MASK_CSRRCI)
+ DECLARE_INSN(hfence_vvma, MATCH_HFENCE_VVMA, MASK_HFENCE_VVMA)
+ DECLARE_INSN(hfence_gvma, MATCH_HFENCE_GVMA, MASK_HFENCE_GVMA)
++DECLARE_INSN(r_counter_tree, MATCH_R_COUNTER_TREE, MASK_R_COUNTER_TREE)
+ DECLARE_INSN(c_nop, MATCH_C_NOP, MASK_C_NOP)
+ DECLARE_INSN(c_addi16sp, MATCH_C_ADDI16SP, MASK_C_ADDI16SP)
+ DECLARE_INSN(c_jr, MATCH_C_JR, MASK_C_JR)
+@@ -2671,6 +2838,73 @@ DECLARE_CSR(pmpaddr12, CSR_PMPADDR12)
+ DECLARE_CSR(pmpaddr13, CSR_PMPADDR13)
+ DECLARE_CSR(pmpaddr14, CSR_PMPADDR14)
+ DECLARE_CSR(pmpaddr15, CSR_PMPADDR15)
++DECLARE_CSR(E_srange_vbase, CSR_E_SRANGE_VBASE)
++DECLARE_CSR(E_srange_vsize, CSR_E_SRANGE_VSIZE)
++DECLARE_CSR(E_ssid_0, CSR_E_SSID_0)
++DECLARE_CSR(E_ssid_1, CSR_E_SSID_1)
++DECLARE_CSR(E_mrange_vbase, CSR_E_MRANGE_VBASE)
++DECLARE_CSR(E_mrange_vsize, CSR_E_MRANGE_VSIZE)
++DECLARE_CSR(E_msid_0, CSR_E_MSID_0)
++DECLARE_CSR(E_msid_1, CSR_E_MSID_1)
++DECLARE_CSR(E_ltweak, CSR_E_LTWEAK)
++DECLARE_CSR(E_ltweak_xrange_map, CSR_E_LTWEAK_XRANGE_MAP)
++DECLARE_CSR(E_ltweak_xrange_map_mask, CSR_E_LTWEAK_XRANGE_MAP_MASK)
++DECLARE_CSR(E_ltweak_prv_lvl, CSR_E_LTWEAK_PRV_LVL)
++DECLARE_CSR(E_ltweak_prv_lvl_mask, CSR_E_LTWEAK_PRV_LVL_MASK)
++DECLARE_CSR(E_ltweak_tweak_en, CSR_E_LTWEAK_TWEAK_EN)
++DECLARE_CSR(E_ltweak_pte_msb, CSR_E_LTWEAK_PTE_MSB)
++DECLARE_CSR(E_ltweak_pte_msb_mask, CSR_E_LTWEAK_PTE_MSB_MASK)
++DECLARE_CSR(E_ltweak_pte_lsb, CSR_E_LTWEAK_PTE_LSB)
++DECLARE_CSR(E_ltweak_pte_lsb_mask, CSR_E_LTWEAK_PTE_LSB_MASK)
++DECLARE_CSR(E_stweak, CSR_E_STWEAK)
++DECLARE_CSR(E_stweak_xrange_map, CSR_E_STWEAK_XRANGE_MAP)
++DECLARE_CSR(E_stweak_xrange_map_mask, CSR_E_STWEAK_XRANGE_MAP_MASK)
++DECLARE_CSR(E_stweak_prv_lvl, CSR_E_STWEAK_PRV_LVL)
++DECLARE_CSR(E_stweak_prv_lvl_mask, CSR_E_STWEAK_PRV_LVL_MASK)
++DECLARE_CSR(E_stweak_tweak_en, CSR_E_STWEAK_TWEAK_EN)
++DECLARE_CSR(E_stweak_pte_msb, CSR_E_STWEAK_PTE_MSB)
++DECLARE_CSR(E_stweak_pte_msb_mask, CSR_E_STWEAK_PTE_MSB_MASK)
++DECLARE_CSR(E_stweak_pte_lsb, CSR_E_STWEAK_PTE_LSB)
++DECLARE_CSR(E_stweak_pte_lsb_mask, CSR_E_STWEAK_PTE_LSB_MASK)
++DECLARE_CSR(E_status, CSR_E_STATUS)
++DECLARE_CSR(E_secs, CSR_E_SECS)
++DECLARE_CSR(E_tcs, CSR_E_TCS)
++DECLARE_CSR(E_urange_vbase, CSR_E_URANGE_VBASE)
++DECLARE_CSR(E_urange_vsize, CSR_E_URANGE_VSIZE)
++DECLARE_CSR(E_usid_0, CSR_E_USID_0)
++DECLARE_CSR(E_usid_1, CSR_E_USID_1)
++DECLARE_CSR(E_dbg_control, CSR_E_DBG_CONTROL)
++DECLARE_CSR(E_dbg_mrange_vbase, CSR_E_DBG_MRANGE_VBASE)
++DECLARE_CSR(E_dbg_mrange_vsize, CSR_E_DBG_MRANGE_VSIZE)
++DECLARE_CSR(E_dbg_srange_vbase, CSR_E_DBG_SRANGE_VBASE)
++DECLARE_CSR(E_dbg_srange_vsize, CSR_E_DBG_SRANGE_VSIZE)
++DECLARE_CSR(E_dbg_msid_0, CSR_E_DBG_MSID_0)
++DECLARE_CSR(E_dbg_msid_1, CSR_E_DBG_MSID_1)
++DECLARE_CSR(E_dbg_ssid_0, CSR_E_DBG_SSID_0)
++DECLARE_CSR(E_dbg_ssid_1, CSR_E_DBG_SSID_1)
++DECLARE_CSR(E_dbg_ltweak, CSR_E_DBG_LTWEAK)
++DECLARE_CSR(E_dbg_ltweak_xrange_map, CSR_E_DBG_LTWEAK_XRANGE_MAP)
++DECLARE_CSR(E_dbg_ltweak_xrange_map_mask, CSR_E_DBG_LTWEAK_XRANGE_MAP_MASK)
++DECLARE_CSR(E_dbg_ltweak_prv_lvl, CSR_E_DBG_LTWEAK_PRV_LVL)
++DECLARE_CSR(E_dbg_ltweak_prv_lvl_mask, CSR_E_DBG_LTWEAK_PRV_LVL_MASK)
++DECLARE_CSR(E_dbg_ltweak_tweak_en, CSR_E_DBG_LTWEAK_TWEAK_EN)
++DECLARE_CSR(E_dbg_ltweak_pte_msb, CSR_E_DBG_LTWEAK_PTE_MSB)
++DECLARE_CSR(E_dbg_ltweak_pte_msb_mask, CSR_E_DBG_LTWEAK_PTE_MSB_MASK)
++DECLARE_CSR(E_dbg_ltweak_pte_lsb, CSR_E_DBG_LTWEAK_PTE_LSB)
++DECLARE_CSR(E_dbg_ltweak_pte_lsb_mask, CSR_E_DBG_LTWEAK_PTE_LSB_MASK)
++DECLARE_CSR(E_dbg_stweak, CSR_E_DBG_STWEAK)
++DECLARE_CSR(E_dbg_stweak_xrange_map, CSR_E_DBG_STWEAK_XRANGE_MAP)
++DECLARE_CSR(E_dbg_stweak_xrange_map_mask, CSR_E_DBG_STWEAK_XRANGE_MAP_MASK)
++DECLARE_CSR(E_dbg_stweak_prv_lvl, CSR_E_DBG_STWEAK_PRV_LVL)
++DECLARE_CSR(E_dbg_stweak_prv_lvl_mask, CSR_E_DBG_STWEAK_PRV_LVL_MASK)
++DECLARE_CSR(E_dbg_stweak_tweak_en, CSR_E_DBG_STWEAK_TWEAK_EN)
++DECLARE_CSR(E_dbg_stweak_pte_msb, CSR_E_DBG_STWEAK_PTE_MSB)
++DECLARE_CSR(E_dbg_stweak_pte_msb_mask, CSR_E_DBG_STWEAK_PTE_MSB_MASK)
++DECLARE_CSR(E_dbg_stweak_pte_lsb, CSR_E_DBG_STWEAK_PTE_LSB)
++DECLARE_CSR(E_dbg_stweak_pte_lsb_mask, CSR_E_DBG_STWEAK_PTE_LSB_MASK)
++DECLARE_CSR(E_dbg_status, CSR_E_DBG_STATUS)
++DECLARE_CSR(E_dbg_secs, CSR_E_DBG_SECS)
++DECLARE_CSR(E_dbg_tcs, CSR_E_DBG_TCS)
+ DECLARE_CSR(tselect, CSR_TSELECT)
+ DECLARE_CSR(tdata1, CSR_TDATA1)
+ DECLARE_CSR(tdata2, CSR_TDATA2)
+@@ -2776,6 +3010,7 @@ DECLARE_CSR(hpmcounter28h, CSR_HPMCOUNTER28H)
+ DECLARE_CSR(hpmcounter29h, CSR_HPMCOUNTER29H)
+ DECLARE_CSR(hpmcounter30h, CSR_HPMCOUNTER30H)
+ DECLARE_CSR(hpmcounter31h, CSR_HPMCOUNTER31H)
++DECLARE_CSR(E_sesskeyhh, CSR_E_SESSKEYHH)
+ DECLARE_CSR(mstatush, CSR_MSTATUSH)
+ DECLARE_CSR(mcycleh, CSR_MCYCLEH)
+ DECLARE_CSR(minstreth, CSR_MINSTRETH)
+@@ -2808,6 +3043,7 @@ DECLARE_CSR(mhpmcounter28h, CSR_MHPMCOUNTER28H)
+ DECLARE_CSR(mhpmcounter29h, CSR_MHPMCOUNTER29H)
+ DECLARE_CSR(mhpmcounter30h, CSR_MHPMCOUNTER30H)
+ DECLARE_CSR(mhpmcounter31h, CSR_MHPMCOUNTER31H)
++DECLARE_CSR(E_rtidh, CSR_E_RTIDH)
+ #endif
+ #ifdef DECLARE_CAUSE
+ DECLARE_CAUSE("misaligned fetch", CAUSE_MISALIGNED_FETCH)
+@@ -2825,4 +3061,5 @@ DECLARE_CAUSE("machine_ecall", CAUSE_MACHINE_ECALL)
+ DECLARE_CAUSE("fetch page fault", CAUSE_FETCH_PAGE_FAULT)
+ DECLARE_CAUSE("load page fault", CAUSE_LOAD_PAGE_FAULT)
+ DECLARE_CAUSE("store page fault", CAUSE_STORE_PAGE_FAULT)
++DECLARE_CAUSE("decryption_integrity_failure", CAUSE_DECRYPTION_INTEGRITY_FAILURE)
+ #endif
+diff --git a/riscv/insns/lw.h b/riscv/insns/lw.h
+index 4e8ed04..dd93ec6 100644
+--- a/riscv/insns/lw.h
++++ b/riscv/insns/lw.h
+@@ -1 +1 @@
+-WRITE_RD(MMU.load_int32(RS1 + insn.i_imm()));
++    WRITE_RD(MMU.load_int32(RS1 + insn.i_imm()));
+\ No newline at end of file
+diff --git a/riscv/insns/sw.h b/riscv/insns/sw.h
+index aa5ead3..3cc3f08 100644
+--- a/riscv/insns/sw.h
++++ b/riscv/insns/sw.h
+@@ -1 +1 @@
+-MMU.store_uint32(RS1 + insn.s_imm(), RS2);
++MMU.store_uint32(RS1 + insn.s_imm(), RS2);
+\ No newline at end of file
+diff --git a/riscv/interactive.cc b/riscv/interactive.cc
+index 405bf35..2315e36 100644
+--- a/riscv/interactive.cc
++++ b/riscv/interactive.cc
+@@ -81,6 +81,8 @@ void sim_t::interactive()
+   funcs["q"] = funcs["quit"];
+   funcs["help"] = &sim_t::interactive_help;
+   funcs["h"] = funcs["help"];
++  funcs["debugnoise"] = &sim_t::interactive_debug_level;
++  funcs["dn"] = funcs["debugnoise"];
+ 
+   while (!done())
+   {
+@@ -138,10 +140,25 @@ void sim_t::interactive_help(const std::string& cmd, const std::vector<std::stri
+     "q                                 Alias for quit\n"
+     "help                            # This screen!\n"
+     "h                                 Alias for help\n"
++    "debugnoise <level>              # Set the debug log level on the fly!\n"
++    "dn  <level>                       Alias for debugnoise\n"
+     "Note: Hitting enter is the same as: run 1\n"
+     << std::flush;
+ }
+ 
++void sim_t::interactive_debug_level(const std::string& cmd, const std::vector<std::string>& args)
++{
++  if(args.size() != 1) {
++    printf("wrong number of arguments\n");
++    throw trap_interactive();
++  }
++  char *ptr;
++
++  fprintf(stderr, "Setting debug log level from '%zu' ", debug_log_level);
++  debug_log_level = strtoul((args[0]).c_str(), &ptr, 10);
++  fprintf(stderr, "to '%zu' \n", debug_log_level);
++}
++
+ void sim_t::interactive_run_noisy(const std::string& cmd, const std::vector<std::string>& args)
+ {
+   interactive_run(cmd,args,true);
+@@ -279,6 +296,57 @@ void sim_t::interactive_reg(const std::string& cmd, const std::vector<std::strin
+       if ((r + 1) % 4 == 0)
+         fprintf(stderr, "\n");
+     }
++    //print Z CSRs
++    if(! p->supports_extension('Z'))
++      return;
++    int csrs[] = {
++      CSR_E_MSID_0,
++      CSR_E_MSID_1,
++      CSR_E_SSID_0,
++      CSR_E_SSID_1,
++      CSR_E_USID_0,
++      CSR_E_USID_1,
++      CSR_E_DBG_CONTROL,
++      CSR_E_MRANGE_VBASE,
++      CSR_E_MRANGE_VSIZE,
++      CSR_E_SRANGE_VBASE,
++      CSR_E_SRANGE_VSIZE,
++      CSR_E_URANGE_VBASE,
++      CSR_E_URANGE_VSIZE,
++      CSR_E_SECS,
++      CSR_E_TCS,
++      CSR_E_STATUS,
++      
++      CSR_E_LTWEAK,
++      CSR_E_LTWEAK_XRANGE_MAP,
++      CSR_E_LTWEAK_XRANGE_MAP_MASK,
++      CSR_E_LTWEAK_PRV_LVL,
++      CSR_E_LTWEAK_PRV_LVL_MASK,
++      CSR_E_LTWEAK_TWEAK_EN,
++      CSR_E_LTWEAK_PTE_MSB,
++      CSR_E_LTWEAK_PTE_MSB_MASK,
++      CSR_E_LTWEAK_PTE_LSB,
++      CSR_E_LTWEAK_PTE_LSB_MASK,
++
++      CSR_E_STWEAK,
++      CSR_E_STWEAK_XRANGE_MAP,
++      CSR_E_STWEAK_XRANGE_MAP_MASK,
++      CSR_E_STWEAK_PRV_LVL,
++      CSR_E_STWEAK_PRV_LVL_MASK,
++      CSR_E_STWEAK_TWEAK_EN,
++      CSR_E_STWEAK_PTE_MSB,
++      CSR_E_STWEAK_PTE_MSB_MASK,
++      CSR_E_STWEAK_PTE_LSB,
++      CSR_E_STWEAK_PTE_LSB_MASK,
++
++      0
++    };
++    int i = 0;
++    do{
++      fprintf(stderr, "%-21s: 0x%016" PRIx64 "  ", csr_name(csrs[i]), p->get_csr(csrs[i]));
++      if ((i + 1) % 3 == 0)
++        fprintf(stderr, "\n");
++    } while(csrs[++i]);
+   } else
+     fprintf(stderr, "0x%016" PRIx64 "\n", get_reg(args));
+ }
+diff --git a/riscv/mmu.cc b/riscv/mmu.cc
+index 1e8dd8b..5cf767e 100644
+--- a/riscv/mmu.cc
++++ b/riscv/mmu.cc
+@@ -3,6 +3,8 @@
+ #include "mmu.h"
+ #include "simif.h"
+ #include "processor.h"
++#include "decode.h"
++#include "common.h"
+ 
+ mmu_t::mmu_t(simif_t* sim, processor_t* proc)
+  : sim(sim), proc(proc),
+@@ -11,6 +13,7 @@ mmu_t::mmu_t(simif_t* sim, processor_t* proc)
+   check_triggers_store(false),
+   matched_trigger(NULL)
+ {
++  emulated_boot_time_key = 0xFFAA55000055AAFF;
+   flush_tlb();
+   yield_load_reservation();
+ }
+@@ -44,33 +47,41 @@ static void throw_access_exception(reg_t addr, access_type type)
+   }
+ }
+ 
+-reg_t mmu_t::translate(reg_t addr, reg_t len, access_type type)
++translate_extended_t mmu_t::translate(reg_t addr, reg_t len, access_type type)
+ {
+-  if (!proc)
+-    return addr;
+-
++  DEBUG("mmu_t::translate: addr: %#018zx;\n", addr);
++  translate_extended_t translate_ret = {0};
++  if (!proc) {
++    DEBUG("!proc, returning paddr without walk\n");
++    translate_ret.paddr = addr;
++    translate_ret.vaddr = addr;
++    translate_ret.v_to_p_translated = NO;
++    return translate_ret;
++  }
+   reg_t mode = proc->state.prv;
+   if (type != FETCH) {
+     if (!proc->state.debug_mode && get_field(proc->state.mstatus, MSTATUS_MPRV))
+       mode = get_field(proc->state.mstatus, MSTATUS_MPP);
+   }
+ 
+-  reg_t paddr = walk(addr, type, mode) | (addr & (PGSIZE-1));
++  translate_ret = walk(addr, type, mode);
++  reg_t paddr = (translate_ret.paddr) | (addr & (PGSIZE-1));
+   if (!pmp_ok(paddr, len, type, mode))
+     throw_access_exception(addr, type);
+-  return paddr;
++  translate_ret.paddr = paddr;
++  return translate_ret;
+ }
+ 
+ tlb_entry_t mmu_t::fetch_slow_path(reg_t vaddr)
+ {
+-  reg_t paddr = translate(vaddr, sizeof(fetch_temp), FETCH);
++  translate_extended_t translate_meta = translate(vaddr, sizeof(fetch_temp), FETCH);
+ 
+-  if (auto host_addr = sim->addr_to_mem(paddr)) {
+-    return refill_tlb(vaddr, paddr, host_addr, FETCH);
++  if (auto host_addr = sim->addr_to_mem(translate_meta.paddr)) {
++    return refill_tlb(vaddr, translate_meta, host_addr, FETCH);
+   } else {
+-    if (!mmio_load(paddr, sizeof fetch_temp, (uint8_t*)&fetch_temp))
++    if (!mmio_load(translate_meta.paddr, sizeof fetch_temp, (uint8_t*)&fetch_temp))
+       throw trap_instruction_access_fault(vaddr);
+-    tlb_entry_t entry = {(char*)&fetch_temp - vaddr, paddr - vaddr};
++    tlb_entry_t entry = {(char*)&fetch_temp - vaddr, translate_meta.paddr - vaddr, translate_meta};
+     return entry;
+   }
+ }
+@@ -126,31 +137,605 @@ bool mmu_t::mmio_store(reg_t addr, size_t len, const uint8_t* bytes)
+   return sim->mmio_store(addr, len, bytes);
+ }
+ 
++const char* mmu_t::get_pagetype_name(Z_page_types name) {
++   switch (name) {
++      case PT_MONITOR:     return "PT_MONITOR";
++      case PT_ENCLAVE:     return "PT_ENCLAVE";
++      case PT_SHCODE:      return "PT_SHCODE";
++      case PT_SHDATA:      return "PT_SHDATA";
++      case PT_UNPROTECTED: return "PT_UNPROTECTED";
++      case OTHER:          return "OTHER";
++      default: return "XXXXXX";
++   }
++}
++
++const char* mmu_t::get_enclave_range_name(Z_enclave_range_name name) {
++   switch (name) {
++      case NONE: return "None";
++      case MRANGE: return "MRANGE";
++      case SRANGE: return "SRANGE";
++      case URANGE: return "URANGE";
++      default: return "XXXXXX";
++   }
++}
++
++const char* mmu_t::get_enclave_access_name(Z_enclave_access name) {
++   switch (name) {
++      case INSIDE: return "INSIDE";
++      case OUTSIDE: return "OUTSIDE";
++      default: return "XXXXXX";
++   }
++}
++
++Z_status mmu_t::decrypt_authenticate(reg_t len, uint8_t* bytes, translate_extended_t translate_meta) {
++  //emulated_boot_time_key
++  Z_status status = FAIL;
++   if (authenticate(len, bytes, translate_meta) == SUCCESS) {
++     // "decrypt" (i.e. bitwise invert it)
++     for (uint8_t i = 0; i < len; i++) {
++       bytes[i] = ~bytes[i];
++     }
++     status = SUCCESS;
++   }
++  return status;
++}
++
++Z_enclave_range_name mmu_t::effective_range(reg_t vaddr, reg_t len, reg_t effective_range_map) {
++  Z_enclave_range_name effective_range = NONE;
++  
++  if ((effective_range_map & E_XRANGE_MAP_URANGE_MASK) != 0) {
++    VERBOSE("effective_range_map & E_XRANGE_MAP_URANGE_MASK != 0");
++    effective_range = URANGE;
++  } else if ((effective_range_map & E_XRANGE_MAP_SRANGE_MASK) != 0) {
++    VERBOSE("effective_range_map & E_XRANGE_MAP_SRANGE_MASK != 0");
++    effective_range = SRANGE;
++  } else if ((effective_range_map & E_XRANGE_MAP_MRANGE_MASK) != 0) {
++    VERBOSE("effective_range_map & E_XRANGE_MAP_MRANGE_MASK != 0");
++    effective_range = MRANGE;
++  } else {
++    VERBOSE("ELSE......: %#018zx; effective_range_map & E_XRANGE_MAP_MRANGE_MASK = %#018zx\n", effective_range_map, (effective_range_map & E_XRANGE_MAP_MRANGE_MASK));
++    effective_range = NONE;
++  }
++
++  return effective_range;
++}
++
++enclave_range_t mmu_t::get_enclave_range(Z_enclave_range_name range) {
++  enclave_range_t ret = {0};
++  if (proc) {
++    if (range == MRANGE) {
++      ret = proc->get_state()->E.mrange;
++    } else if (range == SRANGE) {
++      ret = proc->get_state()->E.srange;
++    } else if (range == URANGE) {
++      ret = proc->get_state()->E.urange;
++    } else { 
++      INFO("Range is neither M,S or U\n");
++    }
++  } else {
++    ERROR("proc is NULL\n");
++  }
++  return ret;
++}
++
++Z_decision mmu_t::tweaks_are_equal(Z_tweak_t a, Z_tweak_t b) {
++  if (a.voffset != b.voffset) {
++    ERROR("ERROR: a.voffset != b.voffset                          %#018zx != %#018zx\n", a.voffset, b.voffset);
++    return NO;
++  }
++  if (a.range != b.range) {
++    ERROR("ERROR: a.range != b.range                              %s != %s\n", mmu_t::get_enclave_range_name(a.range), mmu_t::get_enclave_range_name(b.range) );
++    return NO;
++  }
++  if (a.range_map != b.range_map) {
++    ERROR("ERROR: a.range_map != b.range_map                      %#018zx != %#018zx\n", a.range_map, b.range_map);
++    return NO;
++  }
++  if (a.prv != b.prv) {
++    ERROR("ERROR: a.prv != b.prv                                  %02hhx != %02hhx\n", a.prv, b.prv);
++    return NO;
++  }
++  if (a.pte_lsb != b.pte_lsb) {
++    ERROR("ERROR: a.pte_lsb != b.pte_lsb                          %#06zx != %#06zx\n", a.pte_lsb, b.pte_lsb);
++    return NO;
++  }
++  if (a.pte_msb != b.pte_msb) {
++    ERROR("ERROR: a.pte_msb != b.pte_msb                          %#06zx != %#06zx\n", a.pte_msb, b.pte_msb);
++    return NO;
++  }
++  if (a.SID.l_0 != b.SID.l_0) {
++    ERROR("ERROR: a.SID.l_0 != b.SID.l_0                          %#018zx != %#018zx\n", a.SID.l_0, b.SID.l_0);
++    return NO;
++  }
++  if (a.SID.h_1 != b.SID.h_1) {
++    ERROR("ERROR: a.SID.h_1 != b.SID.h_1                          %#018zx != %#018zx\n", a.SID.h_1, b.SID.h_1);
++    return NO;
++  }
++  return YES;
++}
++
++Z_page_types mmu_t::  tweak_to_pagetype(Z_tweak_t tweak) {
++  Z_page_types pagetype = OTHER;
++
++  if (tweak.prv == PRV_M) {
++    VERBOSE("tweak.prv == PRV_M\n");
++    pagetype = PT_MONITOR;
++  } else if (tweak.prv == PRV_S) {
++      VERBOSE("tweak.prv == PRV_S\n");
++      pagetype = PT_UNPROTECTED;
++  } else if(tweak.prv == PRV_U) {
++    if (tweak.range == NONE) {
++      VERBOSE("tweak.range == NONE\n");
++      pagetype = PT_UNPROTECTED;
++    } else if (tweak.range == MRANGE) {
++      VERBOSE("tweak.range == MRANGE\n");
++      switch (get_field(tweak.pte_msb, PTE_MSB_SOFT_SID_MASK)) {
++        case 0b01: pagetype = PT_ENCLAVE; break;
++        case 0b10: pagetype = PT_SHCODE; break;
++      }
++    } else if (tweak.range == URANGE) {
++      if (get_field(tweak.pte_msb, PTE_MSB_SOFT_SID_MASK) == 0b11) {
++        VERBOSE("tweak.range == URANGE && get_field(tweak.pte_msb, PTE_MSB_SOFT_SID_MASK) == 0b11\n");
++        pagetype = PT_SHDATA;
++      }
++    }
++  }
++
++  VERBOSE("tweak.prv = %#018zx\n", tweak.prv);
++  VERBOSE("tweak.range = %s\n", get_pagetype_name(pagetype));
++  VERBOSE("get_field(tweak.pte_msb, PTE_MSB_SOFT_SID_MASK) = %#018zx\n", get_field(tweak.pte_msb, PTE_MSB_SOFT_SID_MASK));
++  
++  return pagetype;
++}
++
++Z_tweak_t mmu_t::get_tweak(reg_t vaddr, reg_t pte_msb, reg_t pte_lsb) {
++    Z_tweak_t state_tweak = {0};
++  
++  if (proc) {
++    enclave_t E = proc->get_state()->E;
++
++    DEBUG("//-------------------MRANGE------------------------------\n");
++    Z_enclave_access mrange = enclave_address_check(vaddr, 1, E.mrange);
++    DEBUG("//-------------------SRANGE------------------------------\n");
++    Z_enclave_access srange = enclave_address_check(vaddr, 1, E.srange);
++    DEBUG("//-------------------URANGE------------------------------\n");
++    Z_enclave_access urange = enclave_address_check(vaddr, 1, E.urange);
++    DEBUG("//-------------------------------------------------------\n");
++    
++    state_tweak.range_map = (mrange == INSIDE) ? 1 : 0;
++    state_tweak.range_map <<= 1;
++    state_tweak.range_map |= (srange == INSIDE) ? 1 : 0;
++    state_tweak.range_map <<= 1;
++    state_tweak.range_map |= (urange == INSIDE) ? 1 : 0;
++    
++    // overwrite range based
++    state_tweak.range = effective_range(vaddr, 1, state_tweak.range_map);
++
++    reg_t mode = proc->get_state()->prv;
++    if (!proc->state.debug_mode && get_field(proc->state.mstatus, MSTATUS_MPRV)){
++      mode = get_field(proc->state.mstatus, MSTATUS_MPP);
++    }
++    state_tweak.prv = mode;
++
++
++    state_tweak.pte_lsb = pte_lsb & E_GLOBAL_PTE_LSB_CONFIG_MASK;
++    
++    state_tweak.pte_msb = pte_msb & E_GLOBAL_PTE_MSB_CONFIG_MASK;
++    
++    enclave_range_t range_base = get_enclave_range(state_tweak.range);
++    state_tweak.voffset = vaddr - range_base.vbase;
++
++    state_tweak.SID.l_0 = 0;
++    state_tweak.SID.h_1 = 0;
++
++    reg_t rsw = get_field(state_tweak.pte_msb, PTE_MSB_SOFT_SID_MASK);
++    if (rsw & 0x1 == 1) {
++      if (state_tweak.range == MRANGE) {
++        state_tweak.SID.l_0 = E.rtid;
++      } else if (state_tweak.range == SRANGE) {
++        state_tweak.SID.l_0 = E.ssid_0;
++      } else if (state_tweak.range == URANGE) {
++        state_tweak.SID.l_0 = E.sesskeyl;
++      }
++    } else if (((rsw & 0x2) >> 1) == 1) {
++      if (state_tweak.range == MRANGE) {
++        state_tweak.SID.h_1 = E.sid_shcode;
++      } else if (state_tweak.range == SRANGE) {
++        state_tweak.SID.h_1 = E.ssid_1;
++      } else if (state_tweak.range == URANGE) {
++        state_tweak.SID.h_1 = E.sesskeyh;
++      }
++    }    
++  }
++
++  VERBOSE("state_tweak.range:     %s\n", get_enclave_range_name(state_tweak.range) );
++  VERBOSE("state_tweak.range_map: %018zx\n", state_tweak.range_map);
++  VERBOSE("state_tweak.prv:       %018zx\n", state_tweak.prv);
++  VERBOSE("state_tweak.pte_lsb:   %018zx\n", state_tweak.pte_lsb);
++  VERBOSE("state_tweak.pte_msb:   %018zx\n", state_tweak.pte_msb);
++  VERBOSE("state_tweak.voffset:   %018zx\n", state_tweak.voffset);
++  VERBOSE("state_tweak.SID.h_1:   %018zx\n", state_tweak.SID.h_1);
++  VERBOSE("state_tweak.SID.l_0:   %018zx\n", state_tweak.SID.l_0);
++
++  return state_tweak;
++}
++
++Z_tweak_t mmu_t::effective_tweak(reg_t vaddr, reg_t pte_msb, reg_t pte_lsb, enclave_tweak_t tweak_override) {
++  Z_tweak_t effective_tweak = get_tweak(vaddr, pte_msb, pte_lsb);
++  
++  if (proc && tweak_override.tweak_en == 1) {
++    enclave_t E = proc->get_state()->E;
++    
++    effective_tweak.range_map = (effective_tweak.range_map & ~tweak_override.xrange_map_mask) | (tweak_override.xrange_map & tweak_override.xrange_map_mask);
++
++    // reevaluate effective range after masking it
++    effective_tweak.range = effective_range(vaddr, 1, effective_tweak.range_map);
++
++    effective_tweak.prv = (effective_tweak.prv & ~tweak_override.prv_lvl_mask) | (tweak_override.prv_lvl & tweak_override.prv_lvl_mask);
++
++    effective_tweak.pte_lsb = ((effective_tweak.pte_lsb & E_GLOBAL_PTE_LSB_CONFIG_MASK) & ~tweak_override.pte_lsb_mask) 
++                          | ((tweak_override.pte_lsb & E_GLOBAL_PTE_LSB_CONFIG_MASK) & tweak_override.pte_lsb_mask);
++
++    effective_tweak.pte_msb = ((effective_tweak.pte_msb & E_GLOBAL_PTE_MSB_CONFIG_MASK) & ~tweak_override.pte_msb_mask) 
++                          | ((tweak_override.pte_msb & E_GLOBAL_PTE_MSB_CONFIG_MASK) & tweak_override.pte_msb_mask);
++    
++    enclave_range_t range_base = get_enclave_range(effective_tweak.range);
++
++    effective_tweak.voffset = vaddr - range_base.vbase;
++
++    effective_tweak.SID.l_0 = 0;
++    effective_tweak.SID.h_1 = 0;
++
++    reg_t rsw = get_field(effective_tweak.pte_msb, PTE_MSB_SOFT_SID_MASK);
++    if (rsw & 0x1 == 1) {
++      if (effective_tweak.range == MRANGE) {
++        effective_tweak.SID.l_0 = E.rtid;
++      } else if (effective_tweak.range == SRANGE) {
++        effective_tweak.SID.l_0 = E.ssid_0;
++      } else if (effective_tweak.range == URANGE) {
++        effective_tweak.SID.l_0 = E.sesskeyl;
++      }
++    } else if (((rsw & 0x2) >> 1) == 1) {
++      if (effective_tweak.range == MRANGE) {
++        effective_tweak.SID.h_1 = E.sid_shcode;
++      } else if (effective_tweak.range == SRANGE) {
++        effective_tweak.SID.h_1 = E.ssid_1;
++      } else if (effective_tweak.range == URANGE) {
++        effective_tweak.SID.h_1 = E.sesskeyh;
++      }
++    }    
++  }
++
++  VERBOSE("effective_tweak.range:     %s\n", get_enclave_range_name(effective_tweak.range) );
++  VERBOSE("effective_tweak.range_map: %018zx\n", effective_tweak.range_map);
++  VERBOSE("effective_tweak.prv:       %018zx\n", effective_tweak.prv);
++  VERBOSE("effective_tweak.pte_lsb:   %018zx\n", effective_tweak.pte_lsb);
++  VERBOSE("effective_tweak.pte_msb:   %018zx\n", effective_tweak.pte_msb);
++  VERBOSE("effective_tweak.voffset:   %018zx\n", effective_tweak.voffset);
++  VERBOSE("effective_tweak.SID.h_1:   %018zx\n", effective_tweak.SID.h_1);
++  VERBOSE("effective_tweak.SID.l_0:   %018zx\n", effective_tweak.SID.l_0);
++
++  return effective_tweak;
++}
++
++Z_status mmu_t::encrypt_authenticate(reg_t len, uint8_t* bytes, translate_extended_t translate_meta) {
++  Z_status status = SUCCESS;
++  
++  if (proc) {
++    for (uint8_t i = 0; i < len; i++) {
++
++      // encrypt the byte
++      bytes[i] = ~bytes[i];
++
++      emulated_authentication[translate_meta.paddr + i].data_byte = bytes[i];
++      Z_tweak_t effective_tweak = mmu_t::effective_tweak(translate_meta.vaddr + i, translate_meta.pte_msb, translate_meta.pte_lsb, proc->get_state()->E.stweak);
++      emulated_authentication[translate_meta.paddr + i].tweak = effective_tweak;
++
++      DEBUG("encrypt_authenticate on (%#018zx)\n", translate_meta.paddr + i);
++      DEBUG("     (reference-RAM) data_byte[%hhu]    %02hhx ==  %02hhx\n", i, emulated_authentication[translate_meta.paddr + i].data_byte  , bytes[i]);
++      DEBUG("     (reference-RAM) voffset           %#018zx\n",    emulated_authentication[translate_meta.paddr + i].tweak.voffset);
++      DEBUG("     (reference-RAM) range()           %s\n",    mmu_t::get_enclave_range_name(emulated_authentication[translate_meta.paddr + i].tweak.range));
++      DEBUG("     (reference-RAM) range_map         %#018zx\n",    emulated_authentication[translate_meta.paddr + i].tweak.range_map);
++      DEBUG("     (reference-RAM) pte_lsb           %#018zx\n",    emulated_authentication[translate_meta.paddr + i].tweak.pte_lsb);
++      DEBUG("     (reference-RAM) prv                %02hhx\n",    emulated_authentication[translate_meta.paddr + i].tweak.prv);
++      DEBUG("     (reference-RAM) SIDl              %#018zx\n",    emulated_authentication[translate_meta.paddr + i].tweak.SID.l_0);
++      DEBUG("     (reference-RAM) SIDh              %#018zx\n",    emulated_authentication[translate_meta.paddr + i].tweak.SID.h_1);
++      DEBUG("     (state) translate_meta.pte_lsb = %#018zx\n", translate_meta.pte_lsb);
++      DEBUG("     (state) proc->get_state()->E.stweak.pte_lsb = %#018zx\n", proc->get_state()->E.stweak.pte_lsb);
++      DEBUG("     (state) state_E.stweak.pte_lsb_mask = %#018zx\n", proc->get_state()->E.stweak.pte_lsb_mask);
++
++    }
++  } else {
++    ERROR("mmu_t::encrypt_authenticate proc is NULL!!! \n");
++  }
++
++  return status;
++}
++
++// returns true if authentication passed, false if authentication failed
++Z_status mmu_t::authenticate(reg_t len, const uint8_t* bytes, translate_extended_t translate_meta) {
++  
++  if (proc) {
++    if ( get_field(proc->get_state()->E.dbg_control, Z_DBG_AUTH_WEAK) ) {
++      VERBOSE("perform weak authentication\n");
++      return authenticate_weak(len, bytes, translate_meta);
++    } else {
++      VERBOSE("perform strict authentication\n");
++      return authenticate_strict(len, bytes, translate_meta);
++    }
++  }
++  return FAIL;
++}
++
++#define CMP_ERROR2(fmt_str, left, right) do { \
++  if(left == right){ \
++    ERROR(COLOR_YELLOW fmt_str, left, right); }else{ \
++    ERROR(             fmt_str, left, right); } \
++} while(0)
++
++#define CMP_ERROR1(fmt_str, index, left, right) do { \
++  if(left == right){ \
++    ERROR(COLOR_YELLOW fmt_str, index, left, right); }else{ \
++    ERROR(             fmt_str, index, left, right); } \
++} while(0)
++
++// returns true if authentication passed, false if authentication failed
++Z_status mmu_t::authenticate_strict(reg_t len, const uint8_t* bytes, translate_extended_t translate_meta) {
++  Z_status authentication = SUCCESS;
++
++  if (proc) {
++    // bytewise compare word with what's in the authentication array
++    for (uint8_t i = 0; i < len; i++) {
++      auto it = emulated_authentication.find(translate_meta.paddr + i);
++
++      if (it != emulated_authentication.end()) {
++        // byte found in array, need to compare
++        Z_status pagetype_relevant_fields = FAIL;
++
++        Z_tweak_t current_tweak = effective_tweak(translate_meta.vaddr + i, translate_meta.pte_msb, translate_meta.pte_lsb, proc->get_state()->E.ltweak);
++
++        if (mmu_t::tweaks_are_equal(current_tweak, it->second.tweak) == NO
++            || emulated_authentication[translate_meta.paddr + i].data_byte != bytes[i]) {
++          ERROR("authenticate_strict on (%#018zx, VA = %#018zx)\n", translate_meta.paddr + i, translate_meta.vaddr + i);
++          enclave_sid_t SID;
++
++          CMP_ERROR1("     (reference-RAM) data_byte[%hhu]                       %02hhx ==  %02hhx\n", i, emulated_authentication[translate_meta.paddr + i].data_byte  , bytes[i]);
++          CMP_ERROR2("     (reference-RAM) voffset               %#018zx != %#018zx\n", current_tweak.voffset, it->second.tweak.voffset);
++          CMP_ERROR2("     (reference-RAM) range()               %18s != %s\n",    mmu_t::get_enclave_range_name(current_tweak.range), mmu_t::get_enclave_range_name(it->second.tweak.range));
++          CMP_ERROR2("     (reference-RAM) range_map             %#018zx != %#018zx\n", current_tweak.range_map, it->second.tweak.range_map);
++          CMP_ERROR2("     (reference-RAM) prv                                   %02hhx != %02hhx\n",     current_tweak.prv, it->second.tweak.prv);
++          CMP_ERROR2("     (reference-RAM) SIDl                  %#018zx != %#018zx\n",    current_tweak.SID.l_0, it->second.tweak.SID.l_0);
++          CMP_ERROR2("     (reference-RAM) SIDh                  %#018zx != %#018zx\n",    current_tweak.SID.h_1, it->second.tweak.SID.h_1);
++          CMP_ERROR2("     (reference-RAM) pte_lsb               %#018zx != %#018zx\n",    (current_tweak.pte_lsb & E_GLOBAL_PTE_LSB_CONFIG_MASK), (it->second.tweak.pte_lsb & E_GLOBAL_PTE_LSB_CONFIG_MASK));
++          CMP_ERROR2("     (reference-RAM) pte_msb               %#018zx != %#018zx\n",    (current_tweak.pte_msb & E_GLOBAL_PTE_MSB_CONFIG_MASK), (it->second.tweak.pte_msb & E_GLOBAL_PTE_MSB_CONFIG_MASK));
++          ERROR(     "     (state        ) translate_meta.pte_lsb = %#018zx\n", translate_meta.pte_lsb);
++          ERROR(     "     (state        ) E.ltweak.pte_lsb       = %#018zx\n", proc->get_state()->E.ltweak.pte_lsb);
++          ERROR(     "     (state        ) E.ltweak.pte_lsb_mask  = %#018zx\n", proc->get_state()->E.ltweak.pte_lsb_mask);
++
++          authentication = FAIL;
++        } else {
++          DEBUG("auth pass  (reference-RAM) %02hhx == %02hhx\n", it->second.data_byte, bytes[i]);
++        }
++      } else {
++        WARNING("physical address not found in authentication array\n");
++        authentication = FAIL;
++      }
++    }
++  } else {
++    ERROR("ERROR: authenticate_strict proc is NULL\n");
++    authentication = FAIL;
++  }
++
++      
++  if (authentication == FAIL) {
++    ERROR("ERROR to authenticate      ^^^^^^^^\n");
++    ERROR("translate_meta was paddr '%#018zx', vaddr '%#018zx', pte_msb '%hx', pte_lsb '%hx'\n", translate_meta.paddr, translate_meta.vaddr, translate_meta.pte_msb, translate_meta.pte_lsb);
++    ERROR("pc = %zx\n", proc->get_state()->pc);
++  }
++
++  return authentication;
++}
++
++// returns true if authentication passed, false if authentication failed
++Z_status mmu_t::authenticate_weak(reg_t len, const uint8_t* bytes, translate_extended_t translate_meta) {
++  Z_status authentication = SUCCESS;
++
++  if (proc) {
++    // bytewise compare word with what's in the authentication array
++    for (uint8_t i = 0; i < len; i++) {
++      auto it = emulated_authentication.find(translate_meta.paddr + i);
++
++      if (it != emulated_authentication.end()) {
++        // byte found in array, need to compare
++        if (it->second.data_byte != bytes[i]) {
++          ERROR("auth error (reference-RAM) %02hhx != %02hhx\n", it->second.data_byte, bytes[i]);
++          authentication = FAIL;
++        } else {
++          DEBUG("auth pass  (reference-RAM) %02hhx == %02hhx\n", it->second.data_byte, bytes[i]);
++        }
++      } else {
++        WARNING("physical address not found in authentication array\n");
++        authentication = FAIL;
++      }
++    } 
++  } else {
++    ERROR("ERROR: authenticate_weak proc is NULL\n");
++    authentication = FAIL;      
++  }
++
++    
++  if (authentication == FAIL) {
++    ERROR("ERROR to authenticate      ^^^^^^^^\n");
++    ERROR("translate_meta was paddr '%#018zx', pte_msb '%hx', pte_lsb '%hx'\n", translate_meta.paddr, translate_meta.pte_msb, translate_meta.pte_lsb);
++  } 
++
++  return authentication;
++}
++
++Z_enclave_access mmu_t::enclave_address_check(reg_t vaddr, reg_t len, enclave_range_t range) {
++  Z_enclave_access ret = OUTSIDE;
++  reg_t vbase = range.vbase;
++  reg_t vsize = range.vsize;
++  if ( get_field(proc->get_state()->E.dbg_control , Z_DBG_VSIZE_XRANGE_IS_SIZE_NOT_MASK_NO_ALIGNMENT) ) {
++    DEBUG("Performing expensive, unconstrained range check\n");
++    if ((vbase <= vaddr && vaddr < (vbase + vsize)) || (vbase <= (vaddr + len) && (vaddr + len) < (vbase + vsize)) ) {
++      DEBUG("INSIDE range: vaddr: '%#018zx' ; vbase: '%#018zx'; vsize: '%#018zx'; (vbase+vsize): '%#018zx'\n", vaddr, vbase, vsize, (vbase+vsize));
++      ret = INSIDE;
++    }
++    else {
++      DEBUG("OUTSIDE range: vaddr: '%#018zx' ; vbase: '%#018zx'; vsize: '%#018zx'; (vbase+vsize): '%#018zx'\n", vaddr, vbase, vsize, (vbase+vsize));
++      ret = OUTSIDE;
++    }
++  } else {
++    DEBUG("Performing simple range check requireing alignment\n");
++    if (((vaddr & ~vsize) == vbase || ((vaddr + len) & ~vsize) == vbase) && vsize != 0) {
++      DEBUG("INSIDE range: vaddr: '%#018zx' ; vbase: '%#018zx'; vsize: '%#018zx' (vaddr & ~vsize): '%#018zx'\n", vaddr, vbase, vsize, (vaddr & ~vsize));
++      ret = INSIDE;
++    } else {
++      DEBUG("OUTSIDE range: vaddr: '%#018zx' ; vbase: '%#018zx'; vsize: '%#018zx' (vaddr & ~vsize): '%#018zx'\n", vaddr, vbase, vsize, (vaddr & ~vsize));
++      ret = OUTSIDE;
++    }
++  }
++  return ret;
++}
++
+ void mmu_t::load_slow_path(reg_t addr, reg_t len, uint8_t* bytes)
+ {
+-  reg_t paddr = translate(addr, len, LOAD);
++  translate_extended_t translate_meta = translate(addr, len, LOAD);
++  DEBUG("mmu_t::load_slow_path: addr: %#018zx; lenght %zu; translate_meta.paddr %#018zx; pte_msb '%hx', pte_lsb '%hx'\n", addr, len, translate_meta.paddr, translate_meta.pte_msb, translate_meta.pte_lsb);
+ 
+-  if (auto host_addr = sim->addr_to_mem(paddr)) {
++  if (auto host_addr = sim->addr_to_mem(translate_meta.paddr)) {
++    DEBUG("mmu_t::load_slow_path\n");
+     memcpy(bytes, host_addr, len);
+-    if (tracer.interested_in_range(paddr, paddr + PGSIZE, LOAD))
+-      tracer.trace(paddr, len, LOAD);
+-    else
+-      refill_tlb(addr, paddr, host_addr, LOAD);
+-  } else if (!mmio_load(paddr, len, bytes)) {
++    
++    // decrypt data here if necessary
++    if (proc && proc->supports_extension('Z')) {
++      reg_t ltweak_tweak_en = proc->get_state()->E.ltweak.tweak_en;
++      Z_decision force_authentication = NO;
++      Z_tweak_t effective_tweak = mmu_t::effective_tweak(translate_meta.vaddr, translate_meta.pte_msb, translate_meta.pte_lsb, proc->get_state()->E.ltweak);
++      
++      // Decisions on whether the load should go thorugh the authentication and encryption engine
++      if (translate_meta.v_to_p_translated == YES) {
++        
++        Z_page_types effective_pagetype = tweak_to_pagetype(effective_tweak);
++
++        // non unprotected pages need to be authenticated
++        if ((effective_pagetype != PT_UNPROTECTED && effective_pagetype != PT_MONITOR) || (effective_pagetype == PT_MONITOR && ltweak_tweak_en == 1) ) {
++          VERBOSE("tweak_to_pagetype(effective_tweak) = %s != PT_UNPROTECTED && effective_pagetype != PT_MONITOR) || (effective_pagetype == PT_MONITOR && ltweak_tweak_en == 1)\n", get_pagetype_name(effective_pagetype));
++          force_authentication = YES;
++        }
++
++        // marked pages need to be authenticated
++        if ((translate_meta.pte_msb & PTE_MSB_ENCRYPTED_PAGE)  != 0) {
++          VERBOSE("marked as encrypted page: translate_meta.pte_msb & PTE_MSB_ENCRYPTED_PAGE = '%#018zx'\n", (translate_meta.pte_msb & PTE_MSB_ENCRYPTED_PAGE));
++          force_authentication = YES;
++        }
++
++        // unless the tweak override forces them as unprotected
++        if (ltweak_tweak_en == 1 && effective_pagetype == PT_UNPROTECTED) {
++          VERBOSE("load tweak forced no encryption: proc->get_state()->E.ltweak.tweak_en == 1 && effective_pagetype == PT_UNPROTECTED\n");
++          force_authentication = NO;
++        }
++      }
++
++
++      if (force_authentication == YES) {
++          DEBUG("INFO: accessing encrypted dataword\n");
++          if (decrypt_authenticate(len, bytes, translate_meta) == FAIL) {
++            ERROR("ERROR: Decryption failed! proc = %p E.ltweak_en = %zu)\n", \
++                  proc, proc->get_state()->E.ltweak.tweak_en);
++            throw trap_decryption_integrity_fault(addr);
++          }
++        }
++    }
++
++    if (tracer.interested_in_range(translate_meta.paddr, translate_meta.paddr + PGSIZE, LOAD)) {
++      tracer.trace(translate_meta.paddr, len, LOAD);
++    }
++    else {
++      refill_tlb(addr, translate_meta, host_addr, LOAD);
++    }
++  } else if (!mmio_load(translate_meta.paddr, len, bytes)) {
+     throw trap_load_access_fault(addr);
+   }
+ 
+   if (!matched_trigger) {
+     reg_t data = reg_from_bytes(len, bytes);
++    INFO("loaded data is: %#018zx from %#018zx\n", data, addr);
+     matched_trigger = trigger_exception(OPERATION_LOAD, addr, data);
+     if (matched_trigger)
+       throw *matched_trigger;
+   }
+ }
+ 
+-void mmu_t::store_slow_path(reg_t addr, reg_t len, const uint8_t* bytes)
++void mmu_t::store_slow_path(reg_t addr, reg_t len, uint8_t* bytes)
+ {
+-  reg_t paddr = translate(addr, len, STORE);
++  translate_extended_t translate_meta = translate(addr, len, STORE);
++
++  if (proc && proc->supports_extension('Z')) {
++    reg_t stweak_tweak_en = proc->get_state()->E.stweak.tweak_en;
++
++    Z_tweak_t effective_tweak = mmu_t::effective_tweak(translate_meta.vaddr, translate_meta.pte_msb, translate_meta.pte_lsb, proc->get_state()->E.stweak);
++
++    Z_decision force_encrypt                = NO;
++    Z_decision skip_decrypt_before_encrypt  = NO;
++    // Decisions on whether the load should go through the authentication and encryption engine
++    if (translate_meta.v_to_p_translated == YES) {
++
++      Z_page_types effective_pagetype = tweak_to_pagetype(effective_tweak);
++
++      if (effective_pagetype != PT_UNPROTECTED) {
++        VERBOSE("tweak_to_pagetype(effective_tweak) != PT_UNPROTECTED; force_encrypt = YES; skip_decrypt_before_encrypt = NO;\n");
++        force_encrypt = YES;
++        skip_decrypt_before_encrypt = NO;
++      }
++
++      // marked pages need to be authenticated
++      if ((translate_meta.pte_msb & PTE_MSB_ENCRYPTED_PAGE)  != 0) {
++        force_encrypt = YES;
++        skip_decrypt_before_encrypt = NO;
++      }
++
++      // unless the store tweak forces unprotected then there's no neither descryption nor encryption
++      if (stweak_tweak_en == 1) {
++        skip_decrypt_before_encrypt = YES;
++        if (effective_pagetype == PT_UNPROTECTED) {
++          VERBOSE("stweak_tweak_en == 1; skip_decrypt_before_encrypt = YES; force_encrypt = NO;\n");
++          force_encrypt = NO;
++        } else {
++          VERBOSE("stweak_tweak_en == 1; skip_decrypt_before_encrypt = YES; force_encrypt = YES;\n");
++          force_encrypt = YES;
++        }
++      }
++    }
++
++    if (force_encrypt == YES) {
++      VERBOSE("Writing to enclave page!\n");
++
++      if (skip_decrypt_before_encrypt == YES) {
++        DEBUG("Store tweak override != 0 - skip authentication!\n");
++      } else {
++        if (auto host_addr = sim->addr_to_mem(translate_meta.paddr)) {
++          DEBUG("Read and authenticate before write\n");
++          uint8_t ram_data_pre_write[len];
++          memset(ram_data_pre_write, 0, len);
++
++          memcpy(ram_data_pre_write, host_addr, len);
++
++          if (decrypt_authenticate(len, ram_data_pre_write, translate_meta) == FAIL) {
++            ERROR("ERROR: Decryption before encrypt failed! proc = %p E.ltweak_en = %zu)\n", \
++                    proc, proc->get_state()->E.ltweak.tweak_en);
++            throw trap_decryption_integrity_fault(addr);
++          }
++        }
++      }
++
++      if (encrypt_authenticate(len, bytes, translate_meta) == FAIL) {
++        ERROR("ERROR: Encryption failed!\n");
++        throw trap_decryption_integrity_fault(addr);
++      } 
++    }
++  }
+ 
+   if (!matched_trigger) {
+     reg_t data = reg_from_bytes(len, bytes);
+@@ -159,18 +744,18 @@ void mmu_t::store_slow_path(reg_t addr, reg_t len, const uint8_t* bytes)
+       throw *matched_trigger;
+   }
+ 
+-  if (auto host_addr = sim->addr_to_mem(paddr)) {
++  if (auto host_addr = sim->addr_to_mem(translate_meta.paddr)) {
+     memcpy(host_addr, bytes, len);
+-    if (tracer.interested_in_range(paddr, paddr + PGSIZE, STORE))
+-      tracer.trace(paddr, len, STORE);
++    if (tracer.interested_in_range(translate_meta.paddr, translate_meta.paddr + PGSIZE, STORE))
++      tracer.trace(translate_meta.paddr, len, STORE);
+     else
+-      refill_tlb(addr, paddr, host_addr, STORE);
+-  } else if (!mmio_store(paddr, len, bytes)) {
++      refill_tlb(addr, translate_meta, host_addr, STORE);
++  } else if (!mmio_store(translate_meta.paddr, len, bytes)) {
+     throw trap_store_access_fault(addr);
+   }
+ }
+ 
+-tlb_entry_t mmu_t::refill_tlb(reg_t vaddr, reg_t paddr, char* host_addr, access_type type)
++tlb_entry_t mmu_t::refill_tlb(reg_t vaddr, translate_extended_t translate_meta, char* host_addr, access_type type)
+ {
+   reg_t idx = (vaddr >> PGSHIFT) % TLB_ENTRIES;
+   reg_t expected_tag = vaddr >> PGSHIFT;
+@@ -187,13 +772,13 @@ tlb_entry_t mmu_t::refill_tlb(reg_t vaddr, reg_t paddr, char* host_addr, access_
+       (check_triggers_store && type == STORE))
+     expected_tag |= TLB_CHECK_TRIGGERS;
+ 
+-  if (pmp_homogeneous(paddr & ~reg_t(PGSIZE - 1), PGSIZE)) {
++  if (pmp_homogeneous(translate_meta.paddr & ~reg_t(PGSIZE - 1), PGSIZE)) {
+     if (type == FETCH) tlb_insn_tag[idx] = expected_tag;
+     else if (type == STORE) tlb_store_tag[idx] = expected_tag;
+     else tlb_load_tag[idx] = expected_tag;
+   }
+ 
+-  tlb_entry_t entry = {host_addr - vaddr, paddr - vaddr};
++  tlb_entry_t entry = {host_addr - vaddr, translate_meta.paddr - vaddr, translate_meta};
+   tlb_data[idx] = entry;
+   return entry;
+ }
+@@ -285,12 +870,18 @@ reg_t mmu_t::pmp_homogeneous(reg_t addr, reg_t len)
+   return true;
+ }
+ 
+-reg_t mmu_t::walk(reg_t addr, access_type type, reg_t mode)
++translate_extended_t mmu_t::walk(reg_t addr, access_type type, reg_t mode)
+ {
++  INFO("mmu_t::walk: addr: %#018zx;\n", addr);
++  translate_extended_t walk_result = {0};
++  walk_result.vaddr = addr;
++  walk_result.v_to_p_translated = NO;
+   vm_info vm = decode_vm_info(proc->max_xlen, mode, proc->get_state()->satp);
+-  if (vm.levels == 0)
+-    return addr & ((reg_t(2) << (proc->xlen-1))-1); // zero-extend from xlen
+-
++  if (vm.levels == 0) {
++    walk_result.paddr = (reg_t) (addr & ((reg_t(2) << (proc->xlen-1))-1)); // zero-extend from xlen
++    INFO("vm.levels == 0, returning shifted paddr\n");
++    return walk_result;
++  }
+   bool s_mode = mode == PRV_S;
+   bool sum = get_field(proc->state.mstatus, MSTATUS_SUM);
+   bool mxr = get_field(proc->state.mstatus, MSTATUS_MXR);
+@@ -299,8 +890,10 @@ reg_t mmu_t::walk(reg_t addr, access_type type, reg_t mode)
+   int va_bits = PGSHIFT + vm.levels * vm.idxbits;
+   reg_t mask = (reg_t(1) << (proc->xlen - (va_bits-1))) - 1;
+   reg_t masked_msbs = (addr >> (va_bits-1)) & mask;
+-  if (masked_msbs != 0 && masked_msbs != mask)
++  if (masked_msbs != 0 && masked_msbs != mask) {
++    WARNING("masked_msbs != 0 && masked_msbs != mask\n");
+     vm.levels = 0;
++  }
+ 
+   reg_t base = vm.ptbase;
+   for (int i = vm.levels - 1; i >= 0; i--) {
+@@ -314,7 +907,9 @@ reg_t mmu_t::walk(reg_t addr, access_type type, reg_t mode)
+       throw_access_exception(addr, type);
+ 
+     reg_t pte = vm.ptesize == 4 ? from_le(*(uint32_t*)ppte) : from_le(*(uint64_t*)ppte);
+-    reg_t ppn = pte >> PTE_PPN_SHIFT;
++    reg_t ppn = (pte & 0x3FFFFFFFFFFFFF) >> PTE_PPN_SHIFT;
++    reg_t pte_lsb = (pte & PTE_LSB);
++    reg_t pte_msb = (pte & PTE_MSB) >> PTE_MSB_SHIFT;
+ 
+     if (PTE_TABLE(pte)) { // next level of page table
+       base = ppn << PGSHIFT;
+@@ -345,7 +940,13 @@ reg_t mmu_t::walk(reg_t addr, access_type type, reg_t mode)
+       // for superpage mappings, make a fake leaf PTE for the TLB's benefit.
+       reg_t vpn = addr >> PGSHIFT;
+       reg_t value = (ppn | (vpn & ((reg_t(1) << ptshift) - 1))) << PGSHIFT;
+-      return value;
++      walk_result.paddr = value;
++      walk_result.pte_msb = pte_msb;
++      walk_result.pte_lsb = pte_lsb;
++      walk_result.v_to_p_translated = YES;
++
++      INFO("walk: paddr: %#018lx; pte_lsb: %04hX pte_msb: %04hX\n", walk_result.paddr, walk_result.pte_lsb, walk_result.pte_msb);
++      return walk_result;
+     }
+   }
+ 
+diff --git a/riscv/mmu.h b/riscv/mmu.h
+index b84fd4a..64bbdab 100644
+--- a/riscv/mmu.h
++++ b/riscv/mmu.h
+@@ -20,21 +20,56 @@ const reg_t PGSIZE = 1 << PGSHIFT;
+ const reg_t PGMASK = ~(PGSIZE-1);
+ #define MAX_PADDR_BITS 56 // imposed by Sv39 / Sv48
+ 
++// Z extension
++enum Z_status {FAIL, SUCCESS};
++enum Z_decision {YES, NO};
++enum Z_enclave_access {INSIDE, OUTSIDE};
++enum Z_enclave_range_name {NONE, MRANGE, SRANGE, URANGE};
++enum Z_page_types {PT_MONITOR, PT_ENCLAVE, PT_SHCODE, PT_SHDATA, PT_UNPROTECTED, OTHER};
++
+ struct insn_fetch_t
+ {
+   insn_func_t func;
+   insn_t insn;
+ };
+ 
++// Z extension
++struct translate_extended_t {
++  reg_t paddr;
++  reg_t vaddr;
++  Z_decision v_to_p_translated;
++  uint16_t pte_lsb;
++  uint16_t pte_msb;
++};
++
+ struct icache_entry_t {
+   reg_t tag;
+   struct icache_entry_t* next;
+   insn_fetch_t data;
++  // Z extension - metadata for auth checking
++  translate_extended_t z_metadata;
+ };
+ 
+ struct tlb_entry_t {
+   char* host_offset;
+   reg_t target_offset;
++  // Z extension - metadata for auth checking
++  translate_extended_t z_metadata;
++};
++
++struct Z_tweak_t {
++  reg_t voffset;
++  Z_enclave_range_name range;
++  reg_t range_map;
++  reg_t prv;
++  reg_t pte_msb;
++  reg_t pte_lsb;
++  enclave_sid_t SID;
++};
++
++struct authentication_t {
++  uint8_t data_byte;
++  Z_tweak_t tweak;
+ };
+ 
+ class trigger_matched_t
+@@ -94,11 +129,19 @@ public:
+         return misaligned_load(addr, sizeof(type##_t)); \
+       reg_t vpn = addr >> PGSHIFT; \
+       size_t size = sizeof(type##_t); \
+-      if (likely(tlb_load_tag[vpn % TLB_ENTRIES] == vpn)) { \
+-        if (proc) READ_MEM(addr, size); \
+-        return from_le(*(type##_t*)(tlb_data[vpn % TLB_ENTRIES].host_offset + addr)); \
++      INFO("-------\n"); \
++      if (false && likely(tlb_load_tag[vpn % TLB_ENTRIES] == vpn)) { \
++        DEBUG("first if load\n"); \
++        if (proc) { \
++          READ_MEM(addr, size); \
++        } \
++        /* probably return data from the cache? */ \
++        type##_t foo = from_le(*(type##_t*)(tlb_data[vpn % TLB_ENTRIES].host_offset + addr)); \
++        VERBOSE("fetched in load_func. Data is %#034zx\n", (uint64_t) foo); \
++        return foo; \
+       } \
+-      if (unlikely(tlb_load_tag[vpn % TLB_ENTRIES] == (vpn | TLB_CHECK_TRIGGERS))) { \
++      if (false && unlikely(tlb_load_tag[vpn % TLB_ENTRIES] == (vpn | TLB_CHECK_TRIGGERS))) { \
++        DEBUG("second if load\n"); \
+         type##_t data = from_le(*(type##_t*)(tlb_data[vpn % TLB_ENTRIES].host_offset + addr)); \
+         if (!matched_trigger) { \
+           matched_trigger = trigger_exception(OPERATION_LOAD, addr, data); \
+@@ -109,6 +152,7 @@ public:
+         return data; \
+       } \
+       type##_t res; \
++      VERBOSE("load slow path load - from memory - addr: %#018zx;\n", addr); \
+       load_slow_path(addr, sizeof(type##_t), (uint8_t*)&res); \
+       if (proc) READ_MEM(addr, size); \
+       return from_le(res); \
+@@ -140,11 +184,11 @@ public:
+         return misaligned_store(addr, val, sizeof(type##_t)); \
+       reg_t vpn = addr >> PGSHIFT; \
+       size_t size = sizeof(type##_t); \
+-      if (likely(tlb_store_tag[vpn % TLB_ENTRIES] == vpn)) { \
++      if (false && likely(tlb_store_tag[vpn % TLB_ENTRIES] == vpn)) { \
+         if (proc) WRITE_MEM(addr, val, size); \
+         *(type##_t*)(tlb_data[vpn % TLB_ENTRIES].host_offset + addr) = to_le(val); \
+       } \
+-      else if (unlikely(tlb_store_tag[vpn % TLB_ENTRIES] == (vpn | TLB_CHECK_TRIGGERS))) { \
++      else if (false && unlikely(tlb_store_tag[vpn % TLB_ENTRIES] == (vpn | TLB_CHECK_TRIGGERS))) { \
+         if (!matched_trigger) { \
+           matched_trigger = trigger_exception(OPERATION_STORE, addr, val); \
+           if (matched_trigger) \
+@@ -155,7 +199,7 @@ public:
+       } \
+       else { \
+ 	type##_t le_val = to_le(val); \
+-        store_slow_path(addr, sizeof(type##_t), (const uint8_t*)&le_val); \
++        store_slow_path(addr, sizeof(type##_t), (uint8_t*)&le_val); \
+         if (proc) WRITE_MEM(addr, val, size); \
+       } \
+   }
+@@ -215,18 +259,18 @@ public:
+ 
+   inline void acquire_load_reservation(reg_t vaddr)
+   {
+-    reg_t paddr = translate(vaddr, 1, LOAD);
+-    if (auto host_addr = sim->addr_to_mem(paddr))
+-      load_reservation_address = refill_tlb(vaddr, paddr, host_addr, LOAD).target_offset + vaddr;
++    translate_extended_t translate_meta = translate(vaddr, 1, LOAD);
++    if (auto host_addr = sim->addr_to_mem(translate_meta.paddr))
++      load_reservation_address = refill_tlb(vaddr, translate_meta, host_addr, LOAD).target_offset + vaddr;
+     else
+       throw trap_load_access_fault(vaddr); // disallow LR to I/O space
+   }
+ 
+   inline bool check_load_reservation(reg_t vaddr)
+   {
+-    reg_t paddr = translate(vaddr, 1, STORE);
+-    if (auto host_addr = sim->addr_to_mem(paddr))
+-      return load_reservation_address == refill_tlb(vaddr, paddr, host_addr, STORE).target_offset + vaddr;
++    translate_extended_t translate_meta = translate(vaddr, 1, STORE);
++    if (auto host_addr = sim->addr_to_mem(translate_meta.paddr))
++      return load_reservation_address == refill_tlb(vaddr, translate_meta, host_addr, STORE).target_offset + vaddr;
+     else
+       throw trap_store_access_fault(vaddr); // disallow SC to I/O space
+   }
+@@ -242,7 +286,52 @@ public:
+   {
+     auto tlb_entry = translate_insn_addr(addr);
+     insn_bits_t insn = from_le(*(uint16_t*)(tlb_entry.host_offset + addr));
+-    int length = insn_length(insn);
++    
++    // fix the tlb entry physical address:
++    tlb_entry.z_metadata.paddr = (tlb_entry.z_metadata.paddr & (~0xFFF)) | (addr & 0xFFF);
++    tlb_entry.z_metadata.vaddr = addr;
++    insn_bits_t lookahead = insn;
++    Z_decision force_authentication = NO;
++
++    // Elrang violation
++    if (proc && proc->supports_extension('Z')) {
++      enclave_range_t mrange = proc->get_state()->E.mrange;
++      Z_tweak_t tweak = get_tweak(tlb_entry.z_metadata.vaddr, tlb_entry.z_metadata.pte_msb, tlb_entry.z_metadata.pte_lsb);
++
++      Z_page_types pagetype = tweak_to_pagetype(tweak);
++
++      if (// try decrypting if the pagetype isn't unprotected
++          (tlb_entry.z_metadata.v_to_p_translated == YES && 
++            (pagetype != PT_UNPROTECTED
++            ||
++            (tlb_entry.z_metadata.pte_msb & PTE_MSB_ENCRYPTED_PAGE)  != 0
++            || (
++                get_field(proc->get_state()->E.status, E_STATUS_ENCLAVE_MODE_EN) 
++                && !get_field(proc->get_state()->E.dbg_control, Z_DBG_ALLOW_UNSAFE_CODE_FETCHES)
++              )
++            )
++          ))
++          {
++              VERBOSE("force authentication: tlb_entry.z_metadata.v_to_p_translated == YES && (pagetype != PT_UNPROTECTED || (tlb_entry.z_metadata.pte_msb & PTE_MSB_ENCRYPTED_PAGE)  != 0 || (get_field(proc->get_state()->E.status, E_STATUS_ENCLAVE_MODE_EN) && !get_field(proc->get_state()->E.dbg_control, Z_DBG_ALLOW_UNSAFE_CODE_FETCHES)))");
++              force_authentication = YES;
++          }
++        if (force_authentication == YES)
++      {
++            
++            
++        INFO("loaded instruction '%zu' and inverted '%zu' from address: '%#018zx'\n", lookahead, ~lookahead, addr);
++        VERBOSE("accessing encrypted instruction lookahead to determine insn length\n");
++        if (decrypt_authenticate(sizeof(uint16_t), (uint8_t*) &lookahead, tlb_entry.z_metadata) == FAIL) {
++          ERROR("       Instruction was %#018zx with size %lu\n", lookahead, sizeof(lookahead));
++          ERROR("       from address %#018zx\n", addr);
++          ERROR("       from tlb_entry_addr               %#018zx\n", tlb_entry.z_metadata.paddr);
++          ERROR("       from tlb_entry.host_offset + addr %#018zx\n", (uintptr_t)tlb_entry.host_offset + addr);
++          throw trap_decryption_integrity_fault(addr);
++        }
++      }
++    }
++
++    int length = insn_length(lookahead);
+ 
+     if (likely(length == 4)) {
+       insn |= (insn_bits_t)from_le(*(const int16_t*)translate_insn_addr_to_host(addr + 2)) << 16;
+@@ -251,17 +340,38 @@ public:
+     } else if (length == 6) {
+       insn |= (insn_bits_t)from_le(*(const int16_t*)translate_insn_addr_to_host(addr + 4)) << 32;
+       insn |= (insn_bits_t)from_le(*(const uint16_t*)translate_insn_addr_to_host(addr + 2)) << 16;
++
+     } else {
+       static_assert(sizeof(insn_bits_t) == 8, "insn_bits_t must be uint64_t");
+       insn |= (insn_bits_t)from_le(*(const int16_t*)translate_insn_addr_to_host(addr + 6)) << 48;
+       insn |= (insn_bits_t)from_le(*(const uint16_t*)translate_insn_addr_to_host(addr + 4)) << 32;
+-      insn |= (insn_bits_t)from_le(*(const uint16_t*)translate_insn_addr_to_host(addr + 2)) << 16;
++      insn |= (insn_bits_t)from_le(*(const uint16_t*)translate_insn_addr_to_host(addr + 2)) << 16; 
++    }
++    
++    if (proc && proc->supports_extension('Z')) {
++      Z_tweak_t tweak = get_tweak(tlb_entry.z_metadata.vaddr, tlb_entry.z_metadata.pte_msb, tlb_entry.z_metadata.pte_lsb);
++      Z_page_types pagetype = tweak_to_pagetype(tweak);
++
++      if (force_authentication == YES) {
++        INFO("INFO: accessing encrypted instruction full length was %d for instruction %#018zx\n", length, insn);
++        
++        if (decrypt_authenticate(length, (uint8_t*) &insn, tlb_entry.z_metadata) == FAIL) {
++          ERROR("ERROR: Decryption failed! proc = %p && translate_meta.page_type != %s )\n", \
++                proc, get_pagetype_name(pagetype));
++          ERROR("       Instruction was %#018zx with size %lu\n", insn, sizeof(insn));
++          ERROR("       from address %#018zx\n", addr);
++          throw trap_decryption_integrity_fault(addr);
++        }
++        
++        insn = (insn_bits_t) (( (int64_t) (insn << (length*8)) ) >> (length*8));
++      }
+     }
+ 
+     insn_fetch_t fetch = {proc->decode_insn(insn), insn};
+     entry->tag = addr;
+     entry->next = &icache[icache_index(addr + length)];
+     entry->data = fetch;
++    entry->z_metadata = tlb_entry.z_metadata;
+ 
+     reg_t paddr = tlb_entry.target_offset + addr;;
+     if (tracer.interested_in_range(paddr, paddr + 1, FETCH)) {
+@@ -315,6 +425,10 @@ private:
+   reg_t load_reservation_address;
+   uint16_t fetch_temp;
+ 
++  // Z extension
++  std::map<reg_t, authentication_t> emulated_authentication;
++  reg_t emulated_boot_time_key;
++
+   // implement an instruction cache for simulator performance
+   icache_entry_t icache[ICACHE_ENTRIES];
+ 
+@@ -329,30 +443,50 @@ private:
+   reg_t tlb_store_tag[TLB_ENTRIES];
+ 
+   // finish translation on a TLB miss and update the TLB
+-  tlb_entry_t refill_tlb(reg_t vaddr, reg_t paddr, char* host_addr, access_type type);
++  tlb_entry_t refill_tlb(reg_t vaddr, translate_extended_t translate_meta, char* host_addr, access_type type);
+   const char* fill_from_mmio(reg_t vaddr, reg_t paddr);
+ 
+   // perform a page table walk for a given VA; set referenced/dirty bits
+-  reg_t walk(reg_t addr, access_type type, reg_t prv);
++  translate_extended_t walk(reg_t addr, access_type type, reg_t prv);
+ 
+   // handle uncommon cases: TLB misses, page faults, MMIO
+   tlb_entry_t fetch_slow_path(reg_t addr);
++  
++  // Z extension
++  const char* get_enclave_range_name(Z_enclave_range_name name);
++  const char* get_pagetype_name(Z_page_types name);
++  const char* get_enclave_access_name(Z_enclave_access name);
++  Z_decision tweaks_are_equal(Z_tweak_t a, Z_tweak_t b);
++  Z_status decrypt_authenticate(reg_t len, uint8_t* bytes, translate_extended_t translate_meta);
++  Z_status encrypt_authenticate(reg_t len, uint8_t* bytes, translate_extended_t translate_meta);
++  Z_status authenticate(reg_t len, const uint8_t* bytes, translate_extended_t translate_meta);
++  Z_status authenticate_weak(reg_t len, const uint8_t* bytes, translate_extended_t translate_meta);
++  Z_status authenticate_strict(reg_t len, const uint8_t* bytes, translate_extended_t translate_meta);
++  Z_tweak_t get_tweak(reg_t vaddr, reg_t pte_msb, reg_t pte_lsb);
++  Z_tweak_t effective_tweak(reg_t vaddr, reg_t pte_msb, reg_t pte_lsb, enclave_tweak_t tweak);
++  enclave_range_t get_enclave_range(Z_enclave_range_name range);
++  Z_enclave_range_name effective_range(reg_t vaddr, reg_t len, reg_t effective_mrange_map);
++  Z_enclave_access enclave_address_check(reg_t vaddr, reg_t len, enclave_range_t range);
++  Z_page_types tweak_to_pagetype(Z_tweak_t tweak);
++
+   void load_slow_path(reg_t addr, reg_t len, uint8_t* bytes);
+-  void store_slow_path(reg_t addr, reg_t len, const uint8_t* bytes);
++  void store_slow_path(reg_t addr, reg_t len, uint8_t* bytes);
+   bool mmio_load(reg_t addr, size_t len, uint8_t* bytes);
+   bool mmio_store(reg_t addr, size_t len, const uint8_t* bytes);
+   bool mmio_ok(reg_t addr, access_type type);
+-  reg_t translate(reg_t addr, reg_t len, access_type type);
++  translate_extended_t translate(reg_t addr, reg_t len, access_type type);
+ 
+   // ITLB lookup
+   inline tlb_entry_t translate_insn_addr(reg_t addr) {
+     reg_t vpn = addr >> PGSHIFT;
+-    if (likely(tlb_insn_tag[vpn % TLB_ENTRIES] == vpn))
++    if (likely(tlb_insn_tag[vpn % TLB_ENTRIES] == vpn)) {
+       return tlb_data[vpn % TLB_ENTRIES];
++    }
+     tlb_entry_t result;
+     if (unlikely(tlb_insn_tag[vpn % TLB_ENTRIES] != (vpn | TLB_CHECK_TRIGGERS))) {
+       result = fetch_slow_path(addr);
+     } else {
++      VERBOSE("translate_insn_addr, else case\n");
+       result = tlb_data[vpn % TLB_ENTRIES];
+     }
+     if (unlikely(tlb_insn_tag[vpn % TLB_ENTRIES] == (vpn | TLB_CHECK_TRIGGERS))) {
+@@ -406,14 +540,17 @@ struct vm_info {
+ inline vm_info decode_vm_info(int xlen, reg_t prv, reg_t satp)
+ {
+   if (prv == PRV_M) {
++    INFO("decode vm_info as PRV_M\n");
+     return {0, 0, 0, 0};
+   } else if (prv <= PRV_S && xlen == 32) {
++    INFO("decode vm_info as <= PRV_S xlen == 32\n");
+     switch (get_field(satp, SATP32_MODE)) {
+       case SATP_MODE_OFF: return {0, 0, 0, 0};
+       case SATP_MODE_SV32: return {2, 10, 4, (satp & SATP32_PPN) << PGSHIFT};
+       default: abort();
+     }
+   } else if (prv <= PRV_S && xlen == 64) {
++    INFO("decode vm_info as <= PRV_S xlen == 64 \n");
+     switch (get_field(satp, SATP64_MODE)) {
+       case SATP_MODE_OFF: return {0, 0, 0, 0};
+       case SATP_MODE_SV39: return {3, 9, 8, (satp & SATP64_PPN) << PGSHIFT};
+diff --git a/riscv/processor.cc b/riscv/processor.cc
+index 4240fcd..aa3e95b 100644
+--- a/riscv/processor.cc
++++ b/riscv/processor.cc
+@@ -202,7 +202,7 @@ void processor_t::parse_isa_string(const char* str)
+ 
+   char error_msg[256];
+   const char* p = lowercase.c_str();
+-  const char* all_subsets = "imafdqc"
++  const char* all_subsets = "imafdqcz"
+ #ifdef __SIZEOF_INT128__
+     "v"
+ #endif
+@@ -549,7 +549,7 @@ void processor_t::take_trap(trap_t& t, reg_t epc)
+     deleg = state.mideleg, bit &= ~((reg_t)1 << (max_xlen-1));
+   if (state.prv <= PRV_S && bit < max_xlen && ((deleg >> bit) & 1)) {
+     // handle the trap in S-mode
+-    reg_t vector = (state.stvec & 1) && interrupt ? 4*bit : 0;
++    reg_t vector = (state.stvec & 1) ? 4*bit : 0;
+     state.pc = (state.stvec & ~(reg_t)1) + vector;
+     state.scause = t.cause();
+     state.sepc = epc;
+@@ -562,7 +562,7 @@ void processor_t::take_trap(trap_t& t, reg_t epc)
+     set_csr(CSR_MSTATUS, s);
+     set_privilege(PRV_S);
+   } else {
+-    reg_t vector = (state.mtvec & 1) && interrupt ? 4*bit : 0;
++    reg_t vector = (state.mtvec & 1) ? 4*bit : 0;
+     state.pc = (state.mtvec & ~(reg_t)1) + vector;
+     state.mepc = epc;
+     state.mcause = t.cause();
+@@ -659,7 +659,7 @@ void processor_t::set_csr(int which, reg_t val)
+       bool has_fs = supports_extension('S') || supports_extension('F')
+                   || supports_extension('V');
+       bool has_vs = supports_extension('V');
+-
++      
+       reg_t mask = MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_MIE | MSTATUS_MPIE
+                  | MSTATUS_MPRV
+                  | (supports_extension('S') ? MSTATUS_SUM : 0)
+@@ -687,7 +687,6 @@ void processor_t::set_csr(int which, reg_t val)
+         state.mstatus = set_field(state.mstatus, MSTATUS_UXL, xlen_to_uxl(max_xlen));
+       if (supports_extension('S'))
+         state.mstatus = set_field(state.mstatus, MSTATUS_SXL, xlen_to_uxl(max_xlen));
+-      // U-XLEN == S-XLEN == M-XLEN
+       xlen = max_xlen;
+       break;
+     }
+@@ -859,6 +858,224 @@ void processor_t::set_csr(int which, reg_t val)
+       dirty_vs_state;
+       VU.vxrm = val & 0x3ul;
+       break;
++    // Z extension
++    case CSR_E_DBG_MRANGE_VBASE: 
++    case CSR_E_MRANGE_VBASE: 
++      VERBOSE("writing to CSR_E_MRANGE_VBASE\n");
++      state.E.mrange.vbase = val; 
++      break;
++    case CSR_E_DBG_MRANGE_VSIZE: 
++    case CSR_E_MRANGE_VSIZE: 
++      VERBOSE("writing to CSR_E_MRANGE_VSIZE\n");
++      state.E.mrange.vsize = val; 
++      break;
++    case CSR_E_DBG_SRANGE_VBASE: 
++    case CSR_E_SRANGE_VBASE: 
++      VERBOSE("writing to CSR_E_SRANGE_VBASE\n");
++      state.E.srange.vbase = val; 
++      break;
++    case CSR_E_DBG_SRANGE_VSIZE: 
++    case CSR_E_SRANGE_VSIZE: 
++      VERBOSE("writing to CSR_E_SRANGE_VSIZE\n");
++      state.E.srange.vsize = val; 
++      break;
++    case CSR_E_URANGE_VBASE: 
++      VERBOSE("writing to CSR_E_URANGE_VBASE\n");
++      state.E.urange.vbase = val; 
++      break;
++    case CSR_E_URANGE_VSIZE: 
++      VERBOSE("writing to CSR_E_URANGE_VSIZE\n");
++      state.E.urange.vsize = val; 
++      break;
++    case CSR_E_DBG_MSID_0: 
++    case CSR_E_MSID_0: 
++      VERBOSE("writing to CSR_E_MSID_0 (rtid)\n");
++      state.E.rtid = val; 
++      break;
++    case CSR_E_DBG_MSID_1: 
++    case CSR_E_MSID_1: 
++      VERBOSE("writing to CSR_E_MSID_1 (sid_shcode)\n");
++      state.E.sid_shcode = val; 
++      break;
++    case CSR_E_DBG_SSID_0: 
++    case CSR_E_SSID_0: 
++      VERBOSE("writing to CSR_E_SSID_0 (dummy)\n");
++      state.E.ssid_0 = val; 
++      break;
++    case CSR_E_DBG_SSID_1: 
++    case CSR_E_SSID_1: 
++      VERBOSE("writing to CSR_E_SSID_1 (dummy)\n");
++      state.E.ssid_1 = val; 
++      break;
++    case CSR_E_USID_0: 
++      VERBOSE("writing to CSR_E_USID_0 (sesskeyl)\n");
++      state.E.sesskeyl = val; 
++      break;
++    case CSR_E_USID_1: 
++      VERBOSE("writing to CSR_E_USID_1 (sesskeyh)\n");
++      state.E.sesskeyh = val; 
++      break;
++    case CSR_E_DBG_LTWEAK:
++    case CSR_E_LTWEAK: {
++      VERBOSE("writing to CSR_E_LTWEAK\n");
++
++      state.E.ltweak.xrange_map_mask  = get_field(val, E_LSTWEAK_XRANGE_MAP_MASK);
++      state.E.ltweak.xrange_map       = get_field(val, E_LSTWEAK_XRANGE_MAP);
++      state.E.ltweak.prv_lvl_mask     = get_field(val, E_LSTWEAK_PRV_LVL_MASK);
++      state.E.ltweak.prv_lvl          = get_field(val, E_LSTWEAK_PRV_LVL);
++      state.E.ltweak.tweak_en         = get_field(val, E_LSTWEAK_TWEAK_ENABLE);
++      state.E.ltweak.pte_msb_mask     = get_field(val, E_LSTWEAK_PTE_MSB_MASK);
++      state.E.ltweak.pte_msb          = get_field(val, E_LSTWEAK_PTE_MSB);
++      state.E.ltweak.pte_lsb_mask     = get_field(val, E_LSTWEAK_PTE_LSB_MASK);
++      state.E.ltweak.pte_lsb          = get_field(val, E_LSTWEAK_PTE_LSB);
++
++      VERBOSE("state.E.ltweak.xrange_map_mask  %#018zx\n", state.E.stweak.xrange_map_mask);
++      VERBOSE("state.E.ltweak.xrange_map       %#018zx\n", state.E.stweak.xrange_map);
++      VERBOSE("state.E.ltweak.prv_lvl_mask     %#018zx\n", state.E.ltweak.prv_lvl_mask);
++      VERBOSE("state.E.ltweak.prv_lvl          %#018zx\n", state.E.ltweak.prv_lvl);
++      VERBOSE("state.E.ltweak.tweak_en         %#018zx\n", state.E.ltweak.tweak_en);
++      VERBOSE("state.E.ltweak.pte_msb_mask     %#018zx\n", state.E.ltweak.pte_msb_mask);
++      VERBOSE("state.E.ltweak.pte_msb          %#018zx\n", state.E.ltweak.pte_msb);
++      VERBOSE("state.E.ltweak.pte_lsb_mask     %#018zx\n", state.E.ltweak.pte_lsb_mask);
++      VERBOSE("state.E.ltweak.pte_lsb          %#018zx\n", state.E.ltweak.pte_lsb);
++      break;
++    }
++    case CSR_E_DBG_LTWEAK_XRANGE_MAP:
++    case CSR_E_LTWEAK_XRANGE_MAP:
++      VERBOSE("writing to CSR_E_LTWEAK_XRANGE_MAP\n");
++      state.E.ltweak.xrange_map = val & E_XRANGE_MAP_MASK;
++      break;
++    case CSR_E_DBG_LTWEAK_XRANGE_MAP_MASK:
++    case CSR_E_LTWEAK_XRANGE_MAP_MASK:
++      VERBOSE("writing to CSR_E_LTWEAK_XRANGE_MAP_MASK\n");
++      state.E.ltweak.xrange_map_mask = val & E_XRANGE_MAP_MASK;
++      break;
++    case CSR_E_DBG_LTWEAK_PRV_LVL:
++    case CSR_E_LTWEAK_PRV_LVL:
++      VERBOSE("writing to CSR_E_LTWEAK_PRV_LVL\n");
++      state.E.ltweak.prv_lvl = val & E_PRV_LVL_MASK;
++      break;
++    case CSR_E_DBG_LTWEAK_PRV_LVL_MASK:
++    case CSR_E_LTWEAK_PRV_LVL_MASK:
++      VERBOSE("writing to CSR_E_LTWEAK_PRV_LVL_MASK\n");
++      state.E.ltweak.prv_lvl_mask = val & E_PRV_LVL_MASK;
++      break;
++    case CSR_E_DBG_LTWEAK_TWEAK_EN:
++    case CSR_E_LTWEAK_TWEAK_EN:
++      VERBOSE("writing to CSR_E_LTWEAK_TWEAK_EN\n");
++      state.E.ltweak.tweak_en = val & E_TWEAK_ENABLE_MASK;
++      break;
++    case CSR_E_DBG_LTWEAK_PTE_MSB:
++    case CSR_E_LTWEAK_PTE_MSB:
++      VERBOSE("writing to CSR_E_LTWEAK_PTE_MSB\n");
++      state.E.ltweak.pte_msb = val & E_MSB_MASK;
++      break;
++    case CSR_E_DBG_LTWEAK_PTE_MSB_MASK:
++    case CSR_E_LTWEAK_PTE_MSB_MASK:
++      VERBOSE("writing to CSR_E_LTWEAK_PTE_MSB_MASK\n");
++      state.E.ltweak.pte_msb_mask = val & E_MSB_MASK;
++      break;
++    case CSR_E_DBG_LTWEAK_PTE_LSB:
++    case CSR_E_LTWEAK_PTE_LSB:
++      VERBOSE("writing to CSR_E_LTWEAK_PTE_LSB\n");
++      state.E.ltweak.pte_lsb = val & E_LSB_MASK;
++      break;
++    case CSR_E_DBG_LTWEAK_PTE_LSB_MASK:
++    case CSR_E_LTWEAK_PTE_LSB_MASK:
++      VERBOSE("writing to CSR_E_LTWEAK_PTE_LSB_MASK\n");
++      state.E.ltweak.pte_lsb_mask = val & E_LSB_MASK;
++      break;
++
++    case CSR_E_DBG_STWEAK:
++    case CSR_E_STWEAK: {
++      VERBOSE("writing to CSR_E_STWEAK\n");
++
++      state.E.stweak.xrange_map_mask  = get_field(val, E_LSTWEAK_XRANGE_MAP_MASK);
++      state.E.stweak.xrange_map       = get_field(val, E_LSTWEAK_XRANGE_MAP);
++      state.E.stweak.prv_lvl_mask     = get_field(val, E_LSTWEAK_PRV_LVL_MASK);
++      state.E.stweak.prv_lvl          = get_field(val, E_LSTWEAK_PRV_LVL);
++      state.E.stweak.tweak_en         = get_field(val, E_LSTWEAK_TWEAK_ENABLE);
++      state.E.stweak.pte_msb_mask     = get_field(val, E_LSTWEAK_PTE_MSB_MASK);
++      state.E.stweak.pte_msb          = get_field(val, E_LSTWEAK_PTE_MSB);
++      state.E.stweak.pte_lsb_mask     = get_field(val, E_LSTWEAK_PTE_LSB_MASK);
++      state.E.stweak.pte_lsb          = get_field(val, E_LSTWEAK_PTE_LSB);
++
++      VERBOSE("state.E.stweak.xrange_map_mask  %#018zx\n", state.E.stweak.xrange_map_mask);
++      VERBOSE("state.E.stweak.xrange_map       %#018zx\n", state.E.stweak.xrange_map);
++      VERBOSE("state.E.stweak.prv_lvl_mask     %#018zx\n", state.E.stweak.prv_lvl_mask);
++      VERBOSE("state.E.stweak.prv_lvl          %#018zx\n", state.E.stweak.prv_lvl);
++      VERBOSE("state.E.stweak.tweak_en         %#018zx\n", state.E.stweak.tweak_en);
++      VERBOSE("state.E.stweak.pte_msb_mask     %#018zx\n", state.E.stweak.pte_msb_mask);
++      VERBOSE("state.E.stweak.pte_msb          %#018zx\n", state.E.stweak.pte_msb);
++      VERBOSE("state.E.stweak.pte_lsb_mask     %#018zx\n", state.E.stweak.pte_lsb_mask);
++      VERBOSE("state.E.stweak.pte_lsb          %#018zx\n", state.E.stweak.pte_lsb);
++      break;
++    }
++    case CSR_E_DBG_STWEAK_XRANGE_MAP:
++    case CSR_E_STWEAK_XRANGE_MAP:
++      VERBOSE("writing to CSR_E_STWEAK_RANGE_MAP\n");
++      state.E.stweak.xrange_map = val & E_XRANGE_MAP_MASK;
++      break;
++    case CSR_E_DBG_STWEAK_XRANGE_MAP_MASK:
++    case CSR_E_STWEAK_XRANGE_MAP_MASK:
++      VERBOSE("writing to CSR_E_STWEAK_XRANGE_MAP_MASK\n");
++      state.E.stweak.xrange_map_mask = val & E_XRANGE_MAP_MASK;
++      break;
++    case CSR_E_DBG_STWEAK_PRV_LVL:
++    case CSR_E_STWEAK_PRV_LVL:
++      VERBOSE("writing to CSR_E_STWEAK_PRV_LVL\n");
++      state.E.stweak.prv_lvl = val & E_PRV_LVL_MASK;
++      break;
++    case CSR_E_DBG_STWEAK_PRV_LVL_MASK:
++    case CSR_E_STWEAK_PRV_LVL_MASK:
++      VERBOSE("writing to CSR_E_STWEAK_PRV_LVL_MASK\n");
++      state.E.stweak.prv_lvl_mask = val & E_PRV_LVL_MASK;
++      break;
++    case CSR_E_DBG_STWEAK_TWEAK_EN:
++    case CSR_E_STWEAK_TWEAK_EN:
++      VERBOSE("writing to CSR_E_STWEAK_TWEAK_EN\n");
++      state.E.stweak.tweak_en = val & E_TWEAK_ENABLE_MASK;
++      break;
++    case CSR_E_DBG_STWEAK_PTE_MSB:
++    case CSR_E_STWEAK_PTE_MSB:
++      VERBOSE("writing to CSR_E_STWEAK_PTE_MSB\n");
++      state.E.stweak.pte_msb = val & E_MSB_MASK;
++      break;
++    case CSR_E_DBG_STWEAK_PTE_MSB_MASK:
++    case CSR_E_STWEAK_PTE_MSB_MASK:
++      VERBOSE("writing to CSR_E_STWEAK_PTE_MSB_MASK\n");
++      state.E.stweak.pte_msb_mask = val & E_MSB_MASK;
++      break;
++    case CSR_E_DBG_STWEAK_PTE_LSB:
++    case CSR_E_STWEAK_PTE_LSB:
++      VERBOSE("writing to CSR_E_STWEAK_PTE_LSB\n");
++      state.E.stweak.pte_lsb = val & E_LSB_MASK;
++      VERBOSE("state.E.stweak.pte_lsb      %#018zx\n", state.E.stweak.pte_lsb);
++      break;
++    case CSR_E_DBG_STWEAK_PTE_LSB_MASK:
++    case CSR_E_STWEAK_PTE_LSB_MASK:
++      VERBOSE("writing to CSR_E_STWEAK_PTE_LSB_MASK\n");
++      state.E.stweak.pte_lsb_mask = val & E_LSB_MASK;
++      break;
++    case CSR_E_DBG_STATUS: 
++    case CSR_E_STATUS: 
++      VERBOSE("writing to CSR_E_status\n");
++      state.E.status = val; 
++      break;
++    case CSR_E_DBG_SECS: 
++    case CSR_E_SECS: 
++      VERBOSE("writing to CSR_E_SECS\n");
++      state.E.secs = val; 
++      break;
++    case CSR_E_DBG_TCS: 
++    case CSR_E_TCS: 
++      VERBOSE("writing to CSR_E_TCS\n");
++      state.E.tcs = val; 
++      break;
++    case CSR_E_DBG_CONTROL: 
++      VERBOSE("writing to CSR_E_DBG_CONTROL\n");
++      state.E.dbg_control = val; 
++      break;
+   }
+ }
+ 
+@@ -1078,6 +1295,209 @@ reg_t processor_t::get_csr(int which)
+       if (!supports_extension('V'))
+         break;
+       return VU.vlenb;
++    // Z extension
++    case CSR_E_DBG_SRANGE_VBASE: 
++    case CSR_E_SRANGE_VBASE: 
++      if (!supports_extension('Z'))
++        break;
++      return state.E.srange.vbase;
++    case CSR_E_DBG_SRANGE_VSIZE: 
++    case CSR_E_SRANGE_VSIZE: 
++      if (!supports_extension('Z'))
++        break;
++      return state.E.srange.vsize;
++    case CSR_E_DBG_SSID_0: 
++    case CSR_E_SSID_0: 
++      if (!supports_extension('Z'))
++        break;
++      return state.E.ssid_0;
++    case CSR_E_DBG_SSID_1: 
++    case CSR_E_SSID_1: 
++      if (!supports_extension('Z'))
++        break;
++      return state.E.ssid_1;
++    case CSR_E_DBG_MRANGE_VBASE: 
++    case CSR_E_MRANGE_VBASE: 
++      if (!supports_extension('Z'))
++        break;
++      return state.E.mrange.vbase;
++    case CSR_E_DBG_MRANGE_VSIZE: 
++    case CSR_E_MRANGE_VSIZE: 
++      if (!supports_extension('Z'))
++        break;
++      return state.E.mrange.vsize;
++    case CSR_E_DBG_MSID_0: 
++    case CSR_E_MSID_0: 
++      if (!supports_extension('Z'))
++        break;
++      return state.E.rtid;
++    case CSR_E_DBG_MSID_1: 
++    case CSR_E_MSID_1: 
++      if (!supports_extension('Z'))
++        break;
++      return state.E.sid_shcode;
++    case CSR_E_DBG_LTWEAK:
++    case CSR_E_LTWEAK: {
++        if (!supports_extension('Z'))
++          break;
++        reg_t temp_tweak = 0;
++
++        temp_tweak = set_field(temp_tweak, E_LSTWEAK_XRANGE_MAP      , state.E.ltweak.xrange_map);
++        temp_tweak = set_field(temp_tweak, E_LSTWEAK_XRANGE_MAP_MASK , state.E.ltweak.xrange_map_mask);
++        temp_tweak = set_field(temp_tweak, E_LSTWEAK_PRV_LVL         , state.E.ltweak.prv_lvl);
++        temp_tweak = set_field(temp_tweak, E_LSTWEAK_PRV_LVL_MASK    , state.E.ltweak.prv_lvl_mask);
++        temp_tweak = set_field(temp_tweak, E_LSTWEAK_TWEAK_ENABLE    , state.E.ltweak.tweak_en);
++        temp_tweak = set_field(temp_tweak, E_LSTWEAK_PTE_MSB_MASK    , state.E.ltweak.pte_msb_mask);
++        temp_tweak = set_field(temp_tweak, E_LSTWEAK_PTE_MSB         , state.E.ltweak.pte_msb);
++        temp_tweak = set_field(temp_tweak, E_LSTWEAK_PTE_LSB_MASK    , state.E.ltweak.pte_lsb_mask);
++        temp_tweak = set_field(temp_tweak, E_LSTWEAK_PTE_LSB         , state.E.ltweak.pte_lsb);
++        return temp_tweak;
++    }
++    case CSR_E_DBG_LTWEAK_XRANGE_MAP:
++    case CSR_E_LTWEAK_XRANGE_MAP:
++        if (!supports_extension('Z'))
++          break;
++        return state.E.ltweak.xrange_map;
++    case CSR_E_DBG_LTWEAK_XRANGE_MAP_MASK:
++    case CSR_E_LTWEAK_XRANGE_MAP_MASK:
++        if (!supports_extension('Z'))
++          break;
++        return state.E.ltweak.xrange_map_mask;
++    case CSR_E_DBG_LTWEAK_PRV_LVL:
++    case CSR_E_LTWEAK_PRV_LVL:
++        if (!supports_extension('Z'))
++          break;
++        return state.E.ltweak.prv_lvl;
++    case CSR_E_DBG_LTWEAK_PRV_LVL_MASK:
++    case CSR_E_LTWEAK_PRV_LVL_MASK:
++        if (!supports_extension('Z'))
++          break;
++        return state.E.ltweak.prv_lvl_mask;
++    case CSR_E_DBG_LTWEAK_TWEAK_EN:
++    case CSR_E_LTWEAK_TWEAK_EN:
++        if (!supports_extension('Z'))
++          break;
++        return state.E.ltweak.tweak_en;
++    case CSR_E_DBG_LTWEAK_PTE_MSB:
++    case CSR_E_LTWEAK_PTE_MSB:
++        if (!supports_extension('Z'))
++          break;
++        return state.E.ltweak.pte_msb;
++    case CSR_E_DBG_LTWEAK_PTE_MSB_MASK:
++    case CSR_E_LTWEAK_PTE_MSB_MASK:
++        if (!supports_extension('Z'))
++          break;
++        return state.E.ltweak.pte_msb_mask;
++    case CSR_E_DBG_LTWEAK_PTE_LSB:
++    case CSR_E_LTWEAK_PTE_LSB:
++        if (!supports_extension('Z'))
++          break;
++        return state.E.ltweak.pte_lsb;
++    case CSR_E_DBG_LTWEAK_PTE_LSB_MASK:
++    case CSR_E_LTWEAK_PTE_LSB_MASK:
++        if (!supports_extension('Z'))
++          break;
++        return state.E.ltweak.pte_lsb_mask;
++
++    case CSR_E_DBG_STWEAK:
++    case CSR_E_STWEAK: {
++        if (!supports_extension('Z'))
++          break;
++        reg_t temp_tweak = 0;
++
++        temp_tweak = set_field(temp_tweak, E_LSTWEAK_XRANGE_MAP      , state.E.stweak.xrange_map);
++        temp_tweak = set_field(temp_tweak, E_LSTWEAK_XRANGE_MAP_MASK , state.E.stweak.xrange_map_mask);
++        temp_tweak = set_field(temp_tweak, E_LSTWEAK_PRV_LVL         , state.E.stweak.prv_lvl);
++        temp_tweak = set_field(temp_tweak, E_LSTWEAK_PRV_LVL_MASK    , state.E.stweak.prv_lvl_mask);
++        temp_tweak = set_field(temp_tweak, E_LSTWEAK_TWEAK_ENABLE    , state.E.stweak.tweak_en);
++        temp_tweak = set_field(temp_tweak, E_LSTWEAK_PTE_MSB_MASK    , state.E.stweak.pte_msb_mask);
++        temp_tweak = set_field(temp_tweak, E_LSTWEAK_PTE_MSB         , state.E.stweak.pte_msb);
++        temp_tweak = set_field(temp_tweak, E_LSTWEAK_PTE_LSB_MASK    , state.E.stweak.pte_lsb_mask);
++        temp_tweak = set_field(temp_tweak, E_LSTWEAK_PTE_LSB         , state.E.stweak.pte_lsb);
++
++        VERBOSE("temp stuff                  %#018zx\n", temp_tweak);
++        return temp_tweak;
++    }
++    case CSR_E_DBG_STWEAK_XRANGE_MAP:
++    case CSR_E_STWEAK_XRANGE_MAP:
++        if (!supports_extension('Z'))
++          break;
++        return state.E.stweak.xrange_map;
++    case CSR_E_DBG_STWEAK_XRANGE_MAP_MASK:
++    case CSR_E_STWEAK_XRANGE_MAP_MASK:
++        if (!supports_extension('Z'))
++          break;
++        return state.E.stweak.xrange_map_mask;
++    case CSR_E_DBG_STWEAK_PRV_LVL:
++    case CSR_E_STWEAK_PRV_LVL:
++        if (!supports_extension('Z'))
++          break;
++        return state.E.stweak.prv_lvl;
++    case CSR_E_DBG_STWEAK_PRV_LVL_MASK:
++    case CSR_E_STWEAK_PRV_LVL_MASK:
++        if (!supports_extension('Z'))
++          break;
++        return state.E.stweak.prv_lvl_mask;
++    case CSR_E_DBG_STWEAK_TWEAK_EN:
++    case CSR_E_STWEAK_TWEAK_EN:
++        if (!supports_extension('Z'))
++          break;
++        return state.E.stweak.tweak_en;
++    case CSR_E_DBG_STWEAK_PTE_MSB:
++    case CSR_E_STWEAK_PTE_MSB:
++        if (!supports_extension('Z'))
++          break;
++        return state.E.stweak.pte_msb;
++    case CSR_E_DBG_STWEAK_PTE_MSB_MASK:
++    case CSR_E_STWEAK_PTE_MSB_MASK:
++        if (!supports_extension('Z'))
++          break;
++        return state.E.ltweak.pte_msb_mask;
++    case CSR_E_DBG_STWEAK_PTE_LSB:
++    case CSR_E_STWEAK_PTE_LSB:
++        if (!supports_extension('Z'))
++          break;
++        return state.E.ltweak.pte_lsb;
++    case CSR_E_DBG_STWEAK_PTE_LSB_MASK:
++    case CSR_E_STWEAK_PTE_LSB_MASK:
++        if (!supports_extension('Z'))
++          break;
++        return state.E.ltweak.pte_lsb_mask;
++    case CSR_E_DBG_STATUS: 
++    case CSR_E_STATUS: 
++      if (!supports_extension('Z'))
++        break;
++      return state.E.status;
++    case CSR_E_DBG_SECS:
++    case CSR_E_SECS:
++      if (!supports_extension('Z'))
++        break;
++      return state.E.secs;
++    case CSR_E_DBG_TCS: 
++    case CSR_E_TCS: 
++      if (!supports_extension('Z'))
++        break;
++      return state.E.tcs;
++    case CSR_E_URANGE_VBASE: 
++      if (!supports_extension('Z'))
++        break;
++      return state.E.urange.vbase;
++    case CSR_E_URANGE_VSIZE: 
++      if (!supports_extension('Z'))
++        break;
++      return state.E.urange.vsize;
++    case CSR_E_USID_0: 
++      if (!supports_extension('Z'))
++        break;
++      return state.E.sesskeyl;
++    case CSR_E_USID_1: 
++      if (!supports_extension('Z'))
++        break;
++      return state.E.sesskeyh;
++    case CSR_E_DBG_CONTROL: 
++      if (!supports_extension('Z'))
++        break;
++      return state.E.dbg_control;
+   }
+   throw trap_illegal_instruction(0);
+ }
+diff --git a/riscv/processor.h b/riscv/processor.h
+index f9ec1f1..65bbd5a 100644
+--- a/riscv/processor.h
++++ b/riscv/processor.h
+@@ -85,6 +85,54 @@ typedef struct
+   bool load;
+ } mcontrol_t;
+ 
++typedef struct 
++{
++  reg_t l_0;
++  reg_t h_1;
++} enclave_sid_t;
++
++typedef struct
++{
++  reg_t vbase;
++  reg_t vsize;
++} enclave_range_t;
++
++typedef struct
++{
++  reg_t xrange_map;
++  reg_t xrange_map_mask;
++  reg_t prv_lvl_mask;
++  reg_t prv_lvl;
++  reg_t tweak_en;
++  reg_t pte_lsb;
++  reg_t pte_lsb_mask;
++  reg_t pte_msb;
++  reg_t pte_msb_mask;
++} enclave_tweak_t;
++
++// Z extension
++typedef struct
++{
++  enclave_range_t mrange;
++  enclave_range_t srange;
++  enclave_range_t urange;
++  enclave_tweak_t ltweak;
++  enclave_tweak_t stweak;
++  // enclave_sid_t msid;
++  reg_t rtid;       // msid_0
++  reg_t sid_shcode; // msid_1
++  // enclave_sid_t ssid;
++  reg_t ssid_0;     // currently unused SSID_0 register
++  reg_t ssid_1;     // currently unused SSID_1 register
++  // enclave_sid_t usid;
++  reg_t sesskeyl;   // USID_0
++  reg_t sesskeyh;   // USID_1
++  reg_t status;
++  reg_t secs;
++  reg_t tcs;
++  reg_t dbg_control;
++} enclave_t;
++
+ inline reg_t BITS(reg_t v, int hi, int lo){
+   return (v >> lo) & ((2 << (hi - lo)) - 1);
+ }
+@@ -201,6 +249,9 @@ struct state_t
+   uint32_t frm;
+   bool serialized; // whether timer CSRs are in a well-defined state
+ 
++  // Z extension
++  enclave_t E;
++
+   // When true, execute a single instruction and then enter debug mode.  This
+   // can only be set by executing dret.
+   enum {
+diff --git a/riscv/sim.cc b/riscv/sim.cc
+index 0b29720..2ffeeee 100644
+--- a/riscv/sim.cc
++++ b/riscv/sim.cc
+@@ -16,6 +16,9 @@
+ #include <sys/wait.h>
+ #include <sys/types.h>
+ 
++// global debug log level setting:
++size_t debug_log_level = 1; //set to 1, because we want to see fatal errors only
++
+ volatile bool ctrlc_pressed = false;
+ static void handle_signal(int sig)
+ {
+diff --git a/riscv/sim.h b/riscv/sim.h
+index 91aedab..8d95f9e 100644
+--- a/riscv/sim.h
++++ b/riscv/sim.h
+@@ -112,6 +112,7 @@ private:
+   void interactive_until(const std::string& cmd, const std::vector<std::string>& args, bool noisy);
+   void interactive_until_silent(const std::string& cmd, const std::vector<std::string>& args);
+   void interactive_until_noisy(const std::string& cmd, const std::vector<std::string>& args);
++  void interactive_debug_level(const std::string& cmd, const std::vector<std::string>& args);
+   reg_t get_reg(const std::vector<std::string>& args);
+   freg_t get_freg(const std::vector<std::string>& args);
+   reg_t get_mem(const std::vector<std::string>& args);
+diff --git a/riscv/trap.h b/riscv/trap.h
+index ac048eb..eeb1a3e 100644
+--- a/riscv/trap.h
++++ b/riscv/trap.h
+@@ -59,5 +59,6 @@ DECLARE_TRAP(CAUSE_MACHINE_ECALL, machine_ecall)
+ DECLARE_MEM_TRAP(CAUSE_FETCH_PAGE_FAULT, instruction_page_fault)
+ DECLARE_MEM_TRAP(CAUSE_LOAD_PAGE_FAULT, load_page_fault)
+ DECLARE_MEM_TRAP(CAUSE_STORE_PAGE_FAULT, store_page_fault)
++DECLARE_MEM_TRAP(CAUSE_DECRYPTION_INTEGRITY_FAILURE, decryption_integrity_fault)
+ 
+ #endif
+diff --git a/spike_main/spike.cc b/spike_main/spike.cc
+index 9056f31..ef8ef10 100644
+--- a/spike_main/spike.cc
++++ b/spike_main/spike.cc
+@@ -63,6 +63,7 @@ static void help(int exit_code = 1)
+   fprintf(stderr, "  --dm-no-hasel         Debug module supports hasel\n");
+   fprintf(stderr, "  --dm-no-abstract-csr  Debug module won't support abstract to authenticate\n");
+   fprintf(stderr, "  --dm-no-halt-groups   Debug module won't support halt groups\n");
++  fprintf(stderr, "  --log-level=<level>   Defines the log level from 0 (= no output) to 10 (Very Verbose)\n");
+ 
+   exit(exit_code);
+ }
+@@ -288,6 +289,9 @@ int main(int argc, char** argv)
+   parser.option(0, "log", 1,
+                 [&](const char* s){log_path = s;});
+ 
++
++  parser.option(0, "log-level", 1, [&](const char* s){debug_log_level = strtoull(s, 0, 0);});
++
+   auto argv1 = parser.parse(argv);
+   std::vector<std::string> htif_args(argv1, (const char*const*)argv + argc);
+   if (mems.empty())
+-- 
+2.25.1
+

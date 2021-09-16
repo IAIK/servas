@@ -1,0 +1,1110 @@
+From 6c5d6bd91bc584a5940de49f1892f147a9841d1d Mon Sep 17 00:00:00 2001
+From: Stefan Steinegger <s51908919+Steinegger@users.noreply.github.com>
+Date: Mon, 23 Aug 2021 14:58:16 +0200
+Subject: [PATCH] Add SERVAS support
+
+---
+ .gitignore                      |   1 +
+ .gitmodules                     |  20 --
+ Makefile                        | 167 +++++-------
+ configs/buildroot_defconfig     |  15 +
+ configs/busybox.config          |   2 +-
+ configs/linux_defconfig         |  14 +-
+ patches-linux/0001-servas.patch | 470 ++++++++++++++++++++++++++++++++
+ patches-linux/generate_patch.sh |  10 +
+ riscv-fesvr                     |   1 -
+ riscv-gnu-toolchain             |   1 -
+ riscv-isa-sim                   |   1 -
+ riscv-pk                        |   1 -
+ riscv-tests                     |   1 -
+ rootfs/etc/hostname             |   1 +
+ rootfs/etc/init.d/S41morefixes  |  49 ++++
+ rootfs/etc/init.d/S50sshd       |  61 +++++
+ rootfs/etc/inittab              |  63 +++++
+ rootfs/etc/profile              |   6 +
+ 18 files changed, 759 insertions(+), 125 deletions(-)
+ create mode 100644 patches-linux/0001-servas.patch
+ create mode 100755 patches-linux/generate_patch.sh
+ delete mode 160000 riscv-fesvr
+ delete mode 160000 riscv-gnu-toolchain
+ delete mode 160000 riscv-isa-sim
+ delete mode 160000 riscv-pk
+ delete mode 160000 riscv-tests
+ create mode 100644 rootfs/etc/hostname
+ create mode 100755 rootfs/etc/init.d/S41morefixes
+ create mode 100755 rootfs/etc/init.d/S50sshd
+ create mode 100644 rootfs/etc/inittab
+ create mode 100644 rootfs/etc/profile
+
+diff --git a/.gitignore b/.gitignore
+index a4916b0..5055f6b 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -4,6 +4,7 @@ vmlinux
+ build
+ *.elf
+ rootfs/tetris
++core
+ 
+ riscv-gnu-toolchain/build
+ riscv-fesvr/build
+diff --git a/.gitmodules b/.gitmodules
+index f4621e8..c33d6ab 100644
+--- a/.gitmodules
++++ b/.gitmodules
+@@ -1,23 +1,3 @@
+-[submodule "riscv-tests"]
+-	path = riscv-tests
+-	url = https://github.com/riscv/riscv-tests.git
+-	branch = master
+-[submodule "riscv-pk"]
+-	path = riscv-pk
+-	url = https://github.com/pulp-platform/riscv-pk.git
+-	branch = master
+-[submodule "riscv-isa-sim"]
+-	path = riscv-isa-sim
+-	url = https://github.com/riscv/riscv-isa-sim.git
+-	branch = master
+-[submodule "riscv-gnu-toolchain"]
+-	path = riscv-gnu-toolchain
+-	url = https://github.com/riscv/riscv-gnu-toolchain.git
+-	branch = master
+-[submodule "riscv-fesvr"]
+-	path = riscv-fesvr
+-	url = https://github.com/riscv/riscv-fesvr.git
+-	branch = master
+ [submodule "buildroot"]
+ 	path = buildroot
+ 	url = git://git.buildroot.net/buildroot
+diff --git a/Makefile b/Makefile
+index d43892e..2dbc20b 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,129 +1,101 @@
+ # Makefile for RISC-V toolchain; run 'make help' for usage.
++ifndef RISCV
++    $(error ERROR RISCV is not set. Refusing to continue. Parent Makefile should have set this correctly to ../install or something)
++endif
+ 
+ ROOT     := $(patsubst %/,%, $(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
+-RISCV    ?= $(PWD)/install
++RISCV    ?= $(ROOT)/../install
+ DEST     := $(abspath $(RISCV))
+ PATH     := $(DEST)/bin:$(PATH)
+ 
+ NR_CORES := $(shell nproc)
+ 
+-# default configure flags
+-fesvr-co              = --prefix=$(RISCV) --target=riscv64-unknown-linux-gnu
+-isa-sim-co            = --prefix=$(RISCV) --with-fesvr=$(DEST)
+-gnu-toolchain-co-fast = --prefix=$(RISCV) --disable-gdb# no multilib for fast
+-pk-co                 = --prefix=$(RISCV) --host=riscv64-unknown-linux-gnu CC=riscv64-unknown-linux-gnu-gcc OBJDUMP=riscv64-unknown-linux-gnu-objdump
+-tests-co              = --prefix=$(RISCV)/target
+-
+-# default make flags
+-fesvr-mk                = -j$(NR_CORES)
+-isa-sim-mk              = -j$(NR_CORES)
+-gnu-toolchain-libc-mk   = linux -j$(NR_CORES)
+-pk-mk 					= -j$(NR_CORES)
+-tests-mk         		= -j$(NR_CORES)
+-
+-# linux image
++# ------------------------------------------------------------------------------
++# linux 5.1: ariane-v0.7 from https://github.com/pulp-platform/linux.git
++# old gnu toolchain, old buildroot
+ buildroot_defconfig = configs/buildroot_defconfig
+-linux_defconfig = configs/linux_defconfig
+-busybox_defconfig = configs/busybox.config
+-
+-install-dir:
+-	mkdir -p $(RISCV)
+-
+-$(RISCV)/bin/riscv64-unknown-elf-gcc: gnu-toolchain-newlib
+-	cd riscv-gnu-toolchain/build;\
+-        make -j$(NR_CORES);\
+-        cd $(ROOT)
+-
+-gnu-toolchain-newlib: install-dir
+-	mkdir -p riscv-gnu-toolchain/build
+-	cd riscv-gnu-toolchain/build;\
+-        ../configure --prefix=$(RISCV);\
+-        cd $(ROOT)
+-
+-$(RISCV)/bin/riscv64-unknown-linux-gnu-gcc: gnu-toolchain-no-multilib
+-	cd riscv-gnu-toolchain/build;\
+-	make $(gnu-toolchain-libc-mk);\
+-	cd $(ROOT)
+-
+-gnu-toolchain-libc: $(RISCV)/bin/riscv64-unknown-linux-gnu-gcc
+-
+-gnu-toolchain-no-multilib: install-dir
+-	mkdir -p riscv-gnu-toolchain/build
+-	cd riscv-gnu-toolchain/build;\
+-	../configure $(gnu-toolchain-co-fast);\
+-	cd $(ROOT)
+-
+-fesvr: install-dir $(RISCV)/bin/riscv64-unknown-linux-gnu-gcc
+-	mkdir -p riscv-fesvr/build
+-	cd riscv-fesvr/build;\
+-	../configure $(fesvr-co);\
+-	make $(fesvr-mk);\
+-	make install;\
+-	cd $(ROOT)
+-
+-isa-sim: install-dir $(RISCV)/bin/riscv64-unknown-linux-gnu-gcc fesvr
+-	mkdir -p riscv-isa-sim/build
+-	cd riscv-isa-sim/build;\
+-	../configure $(isa-sim-co);\
+-	make $(isa-sim-mk);\
+-	make install;\
+-	cd $(ROOT)
+-
+-tests: install-dir $(RISCV)/bin/riscv64-unknown-elf-gcc
+-	mkdir -p riscv-tests/build
+-	cd riscv-tests/build;\
+-	autoconf;\
+-	../configure $(tests-co);\
+-	make $(tests-mk);\
+-	make install;\
+-	cd $(ROOT)
+-
+-pk: install-dir $(RISCV)/bin/riscv64-unknown-linux-gnu-gcc
+-	mkdir -p riscv-pk/build
+-	cd riscv-pk/build;\
+-	../configure $(pk-co);\
+-	make $(pk-mk);\
+-	make install;\
+-	cd $(ROOT)
+-
+-all: gnu-toolchain-libc fesvr isa-sim tests pk
++linux_defconfig     = configs/linux_defconfig
++busybox_defconfig   = configs/busybox.config
++buildroot           = buildroot
++
++# ------------------------------------------------------------------------------
++
++#rootfs
++ROOTFS_FILES = $(shell find rootfs/ -type f)
++#ROOTFS_FILES = rootfs/x.elf rootfs/gdb
++ROOTFS_FILES += rootfs/tetris rootfs/cachetest.elf
++
++SDCARDDEVICE = /dev/disk/by-id/TODO
++SDCARDPARTITION = /dev/disk/by-id/TODO-partTODO
++SDCARDPARTITIONNUMBER = -1
++
++RISCV_PK_PATH_RELATIVE = ../riscv-pk
++ifneq ($(shell test -e $(RISCV_PK_PATH_RELATIVE)/configure && echo -n yes),yes)
++	# setting it do something **within** the current directory to avoid breaking CI things
++    RISCV_PK_PATH_RELATIVE = riscv-pk
++endif
++
++.PHONY: all
++all: $(RISCV)/bin/riscv64-unknown-linux-gnu-gcc $(RISCV)/bin/riscv64-unknown-elf-gcc
++
++install-dir = $(RISCV)
++$(install-dir):
++	mkdir -p $@
+ 
+ # benchmark for the cache subsystem
+-cachetest:
+-	cd ./cachetest/ && $(RISCV)/bin/riscv64-unknown-linux-gnu-gcc cachetest.c -o cachetest.elf
+-	cp ./cachetest/cachetest.elf rootfs/
++rootfs/cachetest.elf: ./cachetest/cachetest.c
++	$(RISCV)/bin/riscv64-unknown-linux-gnu-gcc $< -o $@
+ 
+ # cool command-line tetris
+ rootfs/tetris:
+ 	cd ./vitetris/ && make clean && ./configure CC=riscv64-unknown-linux-gnu-gcc && make
+ 	cp ./vitetris/tetris $@
+ 
+-vmlinux: $(buildroot_defconfig) $(linux_defconfig) $(busybox_defconfig) $(RISCV)/bin/riscv64-unknown-elf-gcc $(RISCV)/bin/riscv64-unknown-linux-gnu-gcc cachetest rootfs/tetris
++$(buildroot)/.config: $(buildroot_defconfig) $(linux_defconfig) $(busybox_defconfig)
++	#cd buildroot57 && git apply ../patches/buildroot57.patch || true
++	make -C $(buildroot) defconfig BR2_DEFCONFIG=../$(buildroot_defconfig)
++
++vmlinux: $(buildroot)/.config $(RISCV)/bin/riscv64-unknown-elf-gcc $(RISCV)/bin/riscv64-unknown-linux-gnu-gcc $(ROOTFS_FILES)
++	make -C $(buildroot)
+ 	mkdir -p build
+-	make -C buildroot defconfig BR2_DEFCONFIG=../$(buildroot_defconfig)
+-	make -C buildroot
+-	cp buildroot/output/images/vmlinux build/vmlinux
++	cp $(buildroot)/output/images/vmlinux build/vmlinux
+ 	cp build/vmlinux vmlinux
+ 
+-bbl: vmlinux
+-	cd build && ../riscv-pk/configure --host=riscv64-unknown-elf CC=riscv64-unknown-linux-gnu-gcc OBJDUMP=riscv64-unknown-linux-gnu-objdump --with-payload=vmlinux --enable-logo --with-logo=../configs/logo.txt
++build/Makefile: $(RISCV)/bin/riscv64-unknown-linux-gnu-gcc $(RISCV_PK_PATH_RELATIVE)
++	mkdir -p build
++	# TODO host riscv64-unknown-linux-gnu vs riscv64-unknown-elf
++	cd build && ../$(RISCV_PK_PATH_RELATIVE)/configure --host=riscv64-unknown-elf CC=riscv64-unknown-linux-gnu-gcc OBJDUMP=riscv64-unknown-linux-gnu-objdump --with-payload=vmlinux
++	#--enable-logo --with-logo=../configs/logo.txt
++
++bbl: vmlinux build/Makefile
+ 	make -C build
+ 	cp build/bbl bbl
+ 
+ bbl_binary: bbl
+ 	riscv64-unknown-elf-objcopy -O binary bbl bbl_binary
+ 
+-clean:
+-	rm -rf vmlinux bbl riscv-pk/build/vmlinux riscv-pk/build/bbl cachetest/*.elf rootfs/tetris
+-	make -C buildroot distclean
+-
+ bbl.bin: bbl
+ 	riscv64-unknown-elf-objcopy -S -O binary --change-addresses -0x80000000 $< $@
+ 
+-clean-all: clean
+-	rm -rf riscv-fesvr/build riscv-isa-sim/build riscv-gnu-toolchain/build riscv-tests/build riscv-pk/build
++.PHONY: flashtosdcard
++flashtosdcard:
++	# +1 to round up
++	# +2 since the partition doesnt start at 0 and resizepart needs to know the END and not the size.
++	sudo parted $(SDCARDDEVICE) resizepart $(SDCARDPARTITIONNUMBER) $$(expr $$(stat --printf="%s" bbl.bin) / 1024 / 1024 + 1 + 2)MB
++	test $$(sudo blockdev --getsize64 "$(SDCARDPARTITION)") -ge $$(stat --printf="%s" bbl.bin)
++	sudo dd if=bbl.bin of="$(SDCARDPARTITION)" status=progress oflag=sync bs=1M
++	sync
+ 
+-.PHONY: cachetest rootfs/tetris
++.PHONY: clean
++clean:
++	rm -rf vmlinux
++	# TODO bbl riscv-pk/build/vmlinux riscv-pk/build/bbl cachetest/*.elf rootfs/tetris
++	make -C $(buildroot) distclean
++
++.PHONY: clean-all
++clean-all: clean
++	$(error TODO parent makefile)
++	#rm -rf riscv-fesvr/build riscv-isa-sim/build riscv-gnu-toolchain/build riscv-tests/build riscv-pk/build
+ 
+ help:
+ 	@echo "usage: $(MAKE) [RISCV='<install/here>'] [tool/img] ..."
+@@ -141,8 +113,7 @@ help:
+ 	@echo "There are two clean targets:"
+ 	@echo "    Clean only buildroot"
+ 	@echo "        make clean"
+-	@echo "    Clean everything (including toolchain etc)"
+-	@echo "        make clean-all"
+ 	@echo ""
+ 	@echo "defaults:"
+ 	@echo "    RISCV='$(DEST)'"
++
+diff --git a/configs/buildroot_defconfig b/configs/buildroot_defconfig
+index 376209b..1230852 100644
+--- a/configs/buildroot_defconfig
++++ b/configs/buildroot_defconfig
+@@ -10,7 +10,9 @@ BR2_TOOLCHAIN_EXTERNAL=y
+ BR2_TOOLCHAIN_EXTERNAL_PATH="$(RISCV)"
+ BR2_TOOLCHAIN_EXTERNAL_CUSTOM_PREFIX="$(ARCH)-unknown-linux-gnu"
+ BR2_TOOLCHAIN_EXTERNAL_GCC_8=y
++#BR2_TOOLCHAIN_EXTERNAL_GCC_9=y
+ BR2_TOOLCHAIN_EXTERNAL_HEADERS_4_13=y
++#BR2_TOOLCHAIN_EXTERNAL_HEADERS_5_0=y
+ BR2_TOOLCHAIN_EXTERNAL_CUSTOM_GLIBC=y
+ BR2_TOOLCHAIN_EXTERNAL_CXX=y
+ BR2_ROOTFS_OVERLAY="../rootfs"
+@@ -20,6 +22,9 @@ BR2_LINUX_KERNEL_CUSTOM_REPO_URL="https://github.com/pulp-platform/linux.git"
+ BR2_LINUX_KERNEL_CUSTOM_REPO_VERSION="ariane-v0.7"
+ BR2_LINUX_KERNEL_USE_CUSTOM_CONFIG=y
+ BR2_LINUX_KERNEL_CUSTOM_CONFIG_FILE="../configs/linux_defconfig"
++#
++BR2_LINUX_KERNEL_PATCH="../patches-linux"
++#
+ BR2_PACKAGE_BUSYBOX_CONFIG="../configs/busybox.config"
+ BR2_PACKAGE_DHRYSTONE=y
+ BR2_PACKAGE_MEMSTAT=y
+@@ -35,3 +40,13 @@ BR2_PACKAGE_TCPDUMP=y
+ BR2_TARGET_ROOTFS_CPIO_GZIP=y
+ BR2_TARGET_ROOTFS_INITRAMFS=y
+ # BR2_TARGET_ROOTFS_TAR is not set
++
++#BR2_PACKAGE_GDB_DEBUGGER=y
++BR2_PACKAGE_LMBENCH=y
++BR2_PACKAGE_MAKE=y
++# crashes/panics the kernel at boot:
++#BR2_PACKAGE_PERL=y
++BR2_PACKAGE_LESS=y
++BR2_PACKAGE_NANO=y
++BR2_PACKAGE_NANO_TINY=y
++
+diff --git a/configs/busybox.config b/configs/busybox.config
+index 973be9d..eb4fe2b 100644
+--- a/configs/busybox.config
++++ b/configs/busybox.config
+@@ -413,7 +413,7 @@ CONFIG_FEATURE_AWK_GNU_EXTENSIONS=y
+ # CONFIG_FEATURE_DIFF_DIR is not set
+ CONFIG_ED=y
+ # CONFIG_PATCH is not set
+-# CONFIG_SED is not set
++CONFIG_SED=y
+ CONFIG_VI=y
+ CONFIG_FEATURE_VI_MAX_LEN=4096
+ # CONFIG_FEATURE_VI_8BIT is not set
+diff --git a/configs/linux_defconfig b/configs/linux_defconfig
+index 105edc7..b4ccb0e 100644
+--- a/configs/linux_defconfig
++++ b/configs/linux_defconfig
+@@ -4,7 +4,7 @@ CONFIG_NAMESPACES=y
+ CONFIG_BLK_DEV_INITRD=y
+ CONFIG_INITRAMFS_SOURCE="${BR_BINARIES_DIR}/rootfs.cpio"
+ CONFIG_EMBEDDED=y
+-CONFIG_SMP=y
++CONFIG_SMP=n
+ CONFIG_HZ_100=y
+ CONFIG_CMDLINE="earlyprintk"
+ CONFIG_MODULES=y
+@@ -83,3 +83,15 @@ CONFIG_PRINTK_TIME=y
+ CONFIG_STRIP_ASM_SYMS=y
+ CONFIG_DEBUG_SECTION_MISMATCH=y
+ CONFIG_STACKTRACE=y
++#
++# custom:
++#CONFIG_RISCV_CUSTOM_PROTECTION_KEYS=y
++CONFIG_RISCV_CUSTOM_ENCLAVE=y
++# /proc/self/smaps
++CONFIG_PROC_PAGE_MONITOR=y
++# crashes/panics the kernel at boot
++#CONFIG_CONSOLE_LOGLEVEL_QUIET=7
++#CONFIG_MESSAGE_LOGLEVEL_DEFAULT=7
++#CONFIG_DEBUG_INFO=y
++
++#CONFIG_CMDLINE="loglevel=7"
+diff --git a/patches-linux/0001-servas.patch b/patches-linux/0001-servas.patch
+new file mode 100644
+index 0000000..12b8ee6
+--- /dev/null
++++ b/patches-linux/0001-servas.patch
+@@ -0,0 +1,470 @@
++diff --git a/arch/riscv/Kconfig b/arch/riscv/Kconfig
++index eb56c82d8aa1..a6000d86b62f 100644
++--- a/arch/riscv/Kconfig
+++++ b/arch/riscv/Kconfig
++@@ -282,3 +282,14 @@ menu "Power management options"
++ source "kernel/power/Kconfig"
++ 
++ endmenu
+++
+++menu "Custom"
+++
+++config RISCV_CUSTOM_ENCLAVE
+++       prompt "Custom Risc-V SERVAS Enclave"
+++       def_bool y
+++       depends on 64BIT
+++       select ARCH_USES_HIGH_VMA_FLAGS
+++       select ARCH_HAS_ENCLAVE
+++
+++endmenu
++diff --git a/arch/riscv/include/asm/mman.h b/arch/riscv/include/asm/mman.h
++new file mode 100644
++index 000000000000..0f33f92c63ad
++--- /dev/null
+++++ b/arch/riscv/include/asm/mman.h
++@@ -0,0 +1,49 @@
+++#ifndef _ASM_RISCV_MMAN_H
+++#define _ASM_RISCV_MMAN_H
+++
+++#include <uapi/asm/mman.h>
+++
+++#include <linux/mm.h>
+++#include <asm/pgtable.h>
+++
+++#ifdef CONFIG_RISCV_CUSTOM_ENCLAVE
+++
+++#define PROT_ENCLAVE_SHIFT  12
+++#define PROT_ENCLAVE_MASK   (0x3fful << PROT_ENCLAVE_SHIFT)
+++
+++// PKEY TO VMFLAGS
+++static inline u64 enclave_to_vmflag_bits(unsigned long prot, u16 pkey)
+++{
+++  u64 ret = (((u64)((prot & PROT_ENCLAVE_MASK) >> PROT_ENCLAVE_SHIFT) << VM_ENCLAVE_SHIFT));
+++  //pr_info("enclave_to_vmflag_bits(0x%lx, 0x%x) = 0x%llx\n", prot, pkey, ret);
+++  return ret;
+++}
+++
+++// VMA to PKEY
+++static inline unsigned long vmflags_to_pte_bits(vm_flags_t vm_flags)
+++{
+++  unsigned long enclave_bits = (vm_flags & VM_ENCLAVE_MASK) >> VM_ENCLAVE_SHIFT;
+++  // enclave bits are stored in upper PTE bits (Reserved)
+++  unsigned long pte = enclave_bits << _PAGE_RESERVED_SHIFT;
+++  //pr_info("vmflags_to_pte_bits(0x%lx) = 0x%lx\n", vm_flags, pte);
+++  return pte;
+++}
+++
+++#define arch_vm_get_page_prot(vm_flags)	__pgprot(vmflags_to_pte_bits(vm_flags))
+++
+++#define arch_calc_vm_prot_bits(prot, pkey) enclave_to_vmflag_bits(prot, pkey)
+++
+++static inline bool arch_validate_prot(unsigned long prot, unsigned long addr)
+++{
+++    //pr_info("arch_validate_prot(0x%lx, 0x%lx)\n", prot, addr);
+++    if (prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC | PROT_SEM | PROT_ENCLAVE_MASK))
+++        return false;
+++    return true;
+++}
+++#define arch_validate_prot arch_validate_prot
+++
+++
+++
+++#endif /* CONFIG_RISCV_CUSTOM_ENCLAVE */
+++
+++#endif	/* _ASM_RISCV_MMAN_H */
++diff --git a/arch/riscv/include/asm/pgtable-64.h b/arch/riscv/include/asm/pgtable-64.h
++index 7aa0ea9bd8bb..d8073c8bb7a7 100644
++--- a/arch/riscv/include/asm/pgtable-64.h
+++++ b/arch/riscv/include/asm/pgtable-64.h
++@@ -63,7 +63,7 @@ static inline void pud_clear(pud_t *pudp)
++ 
++ static inline unsigned long pud_page_vaddr(pud_t pud)
++ {
++-	return (unsigned long)pfn_to_virt(pud_val(pud) >> _PAGE_PFN_SHIFT);
+++	return (unsigned long)pfn_to_virt((pud_val(pud) & _PAGE_PFN_MASK) >> _PAGE_PFN_SHIFT);
++ }
++ 
++ #define pmd_index(addr) (((addr) >> PMD_SHIFT) & (PTRS_PER_PMD - 1))
++diff --git a/arch/riscv/include/asm/pgtable-bits.h b/arch/riscv/include/asm/pgtable-bits.h
++index 470755cb7558..a8fb685e5c91 100644
++--- a/arch/riscv/include/asm/pgtable-bits.h
+++++ b/arch/riscv/include/asm/pgtable-bits.h
++@@ -16,8 +16,9 @@
++ 
++ /*
++  * PTE format:
++- * | XLEN-1  10 | 9             8 | 7 | 6 | 5 | 4 | 3 | 2 | 1 | 0
++- *       PFN      reserved for SW   D   A   G   U   X   W   R   V
+++ * | XLEN-1  54 | 53  28 | 27  19 | 18  10 | 9 8 | 7 | 6 | 5 | 4 | 3 | 2 | 1 | 0
+++ * | Reserved   | PPN[2]   PPN[1]   PPN[0] | RSW | D   A   G   U   X   W   R   V
+++ *              |          = PFN           |
++  */
++ 
++ #define _PAGE_ACCESSED_OFFSET 6
++@@ -42,10 +43,57 @@
++ #define _PAGE_PROT_NONE _PAGE_READ
++ 
++ #define _PAGE_PFN_SHIFT 10
+++#ifdef CONFIG_RISCV_CUSTOM_ENCLAVE
+++#define _PAGE_PFN_MASK ( 0x003FFFFFFFFFFC00ULL ) /* = set bits 53..10 = 2^54-2^10 = ~0 ^ _PAGE_PKEY_MASK*/
+++#else
+++#define _PAGE_PFN_MASK ( ~((u64)0) )
+++#endif  /* CONFIG_RISCV_CUSTOM_ENCLAVE */
+++
+++#ifdef CONFIG_RISCV_CUSTOM_ENCLAVE
+++
+++#define _PAGE_RESERVED_SHIFT 54
+++
+++#define _PAGE_RESERVED_BIT0 ( (u64)1 << (_PAGE_RESERVED_SHIFT+0) )
+++#define _PAGE_RESERVED_BIT1 ( (u64)1 << (_PAGE_RESERVED_SHIFT+1) )
+++#define _PAGE_RESERVED_BIT2 ( (u64)1 << (_PAGE_RESERVED_SHIFT+2) )
+++#define _PAGE_RESERVED_BIT3 ( (u64)1 << (_PAGE_RESERVED_SHIFT+3) )
+++#define _PAGE_RESERVED_BIT4 ( (u64)1 << (_PAGE_RESERVED_SHIFT+4) )
+++#define _PAGE_RESERVED_BIT5 ( (u64)1 << (_PAGE_RESERVED_SHIFT+5) )
+++#define _PAGE_RESERVED_BIT6 ( (u64)1 << (_PAGE_RESERVED_SHIFT+6) )
+++#define _PAGE_RESERVED_BIT7 ( (u64)1 << (_PAGE_RESERVED_SHIFT+7) )
+++#define _PAGE_RESERVED_BIT8 ( (u64)1 << (_PAGE_RESERVED_SHIFT+8) )
+++#define _PAGE_RESERVED_BIT9 ( (u64)1 << (_PAGE_RESERVED_SHIFT+9) )
+++
+++#else
+++
+++#define _PAGE_RESERVED_BIT0 (0)
+++#define _PAGE_RESERVED_BIT1 (0)
+++#define _PAGE_RESERVED_BIT2 (0)
+++#define _PAGE_RESERVED_BIT3 (0)
+++#define _PAGE_RESERVED_BIT4 (0)
+++#define _PAGE_RESERVED_BIT5 (0)
+++#define _PAGE_RESERVED_BIT6 (0)
+++#define _PAGE_RESERVED_BIT7 (0)
+++#define _PAGE_RESERVED_BIT8 (0)
+++#define _PAGE_RESERVED_BIT9 (0)
+++
+++#endif /* CONFIG_RISCV_CUSTOM_ENCLAVE */
+++
+++#define _PAGE_RESERVED_MASK ( \
+++	_PAGE_RESERVED_BIT0 | \
+++	_PAGE_RESERVED_BIT1 | \
+++	_PAGE_RESERVED_BIT2 | \
+++	_PAGE_RESERVED_BIT3 | \
+++	_PAGE_RESERVED_BIT4 | \
+++	_PAGE_RESERVED_BIT5 | \
+++	_PAGE_RESERVED_BIT6 | \
+++	_PAGE_RESERVED_BIT7 | \
+++	_PAGE_RESERVED_BIT8 | \
+++	_PAGE_RESERVED_BIT9 )
++ 
++ /* Set of bits to preserve across pte_modify() */
++ #define _PAGE_CHG_MASK  (~(unsigned long)(_PAGE_PRESENT | _PAGE_READ |	\
++ 					  _PAGE_WRITE | _PAGE_EXEC |	\
++-					  _PAGE_USER | _PAGE_GLOBAL))
+++					  _PAGE_USER | _PAGE_GLOBAL | _PAGE_RESERVED_MASK ))
++ 
++ #endif /* _ASM_RISCV_PGTABLE_BITS_H */
++diff --git a/arch/riscv/include/asm/pgtable.h b/arch/riscv/include/asm/pgtable.h
++index 1141364d990e..a0d8714f9e1d 100644
++--- a/arch/riscv/include/asm/pgtable.h
+++++ b/arch/riscv/include/asm/pgtable.h
++@@ -121,10 +121,21 @@ static inline void pmd_clear(pmd_t *pmdp)
++ 	set_pmd(pmdp, __pmd(0));
++ }
++ 
+++// PFN to P**
+++static inline unsigned long pfn_pxx(unsigned long pfn, pgprot_t prot)
+++{
+++	return ((pfn << _PAGE_PFN_SHIFT) | pgprot_val(prot));
+++}
+++// P** to PFN
+++static inline unsigned long pxx_pfn(unsigned long val)
+++{
+++	return (val & _PAGE_PFN_MASK) >> _PAGE_PFN_SHIFT;
+++}
+++
++ 
++ static inline pgd_t pfn_pgd(unsigned long pfn, pgprot_t prot)
++ {
++-	return __pgd((pfn << _PAGE_PFN_SHIFT) | pgprot_val(prot));
+++	return __pgd(pfn_pxx(pfn, prot));
++ }
++ 
++ #define pgd_index(addr) (((addr) >> PGDIR_SHIFT) & (PTRS_PER_PGD - 1))
++@@ -139,18 +150,18 @@ static inline pgd_t *pgd_offset(const struct mm_struct *mm, unsigned long addr)
++ 
++ static inline struct page *pmd_page(pmd_t pmd)
++ {
++-	return pfn_to_page(pmd_val(pmd) >> _PAGE_PFN_SHIFT);
+++	return pfn_to_page(pxx_pfn(pmd_val(pmd)));
++ }
++ 
++ static inline unsigned long pmd_page_vaddr(pmd_t pmd)
++ {
++-	return (unsigned long)pfn_to_virt(pmd_val(pmd) >> _PAGE_PFN_SHIFT);
+++	return (unsigned long)pfn_to_virt(pxx_pfn(pmd_val(pmd)));
++ }
++ 
++ /* Yields the page frame number (PFN) of a page table entry */
++ static inline unsigned long pte_pfn(pte_t pte)
++ {
++-	return (pte_val(pte) >> _PAGE_PFN_SHIFT);
+++	return (pxx_pfn(pte_val(pte)));
++ }
++ 
++ #define pte_page(x)     pfn_to_page(pte_pfn(x))
++@@ -158,7 +169,7 @@ static inline unsigned long pte_pfn(pte_t pte)
++ /* Constructs a page table entry */
++ static inline pte_t pfn_pte(unsigned long pfn, pgprot_t prot)
++ {
++-	return __pte((pfn << _PAGE_PFN_SHIFT) | pgprot_val(prot));
+++	return __pte(pfn_pxx(pfn, prot));
++ }
++ 
++ static inline pte_t mk_pte(struct page *page, pgprot_t prot)
++@@ -306,6 +317,7 @@ static inline void set_pte_at(struct mm_struct *mm,
++ 	if (pte_present(pteval) && pte_exec(pteval))
++ 		flush_icache_pte(pteval);
++ 
+++	//pr_info("set_pte_at(addr = 0x%lx, pteval = 0x%lx)\n", addr, pte_val(pteval));
++ 	set_pte(ptep, pteval);
++ }
++ 
++diff --git a/arch/riscv/include/uapi/asm/hwcap.h b/arch/riscv/include/uapi/asm/hwcap.h
++index f333221c9ab2..c994c9fffccf 100644
++--- a/arch/riscv/include/uapi/asm/hwcap.h
+++++ b/arch/riscv/include/uapi/asm/hwcap.h
++@@ -32,5 +32,6 @@
++ #define COMPAT_HWCAP_ISA_F	(1 << ('F' - 'A'))
++ #define COMPAT_HWCAP_ISA_D	(1 << ('D' - 'A'))
++ #define COMPAT_HWCAP_ISA_C	(1 << ('C' - 'A'))
+++#define COMPAT_HWCAP_ISA_Z	(1 << ('Z' - 'A'))
++ 
++ #endif
++diff --git a/arch/riscv/include/uapi/asm/unistd.h b/arch/riscv/include/uapi/asm/unistd.h
++index 0e2eeeb1fd27..eb1c0a82865b 100644
++--- a/arch/riscv/include/uapi/asm/unistd.h
+++++ b/arch/riscv/include/uapi/asm/unistd.h
++@@ -40,3 +40,9 @@
++ #define __NR_riscv_flush_icache (__NR_arch_specific_syscall + 15)
++ #endif
++ __SYSCALL(__NR_riscv_flush_icache, sys_riscv_flush_icache)
+++
+++
+++#ifndef __NR_riscv_printPTE
+++#define __NR_riscv_printPTE (__NR_arch_specific_syscall + 0)
+++#endif
+++__SYSCALL(__NR_riscv_printPTE, sys_riscv_printPTE)
++diff --git a/arch/riscv/kernel/cpufeature.c b/arch/riscv/kernel/cpufeature.c
++index bc29b010b722..d6e66e07eefc 100644
++--- a/arch/riscv/kernel/cpufeature.c
+++++ b/arch/riscv/kernel/cpufeature.c
++@@ -27,6 +27,10 @@ unsigned long elf_hwcap __read_mostly;
++ bool has_fpu __read_mostly;
++ #endif
++ 
+++#ifdef CONFIG_RISCV_CUSTOM_ENCLAVE
+++bool has_enclave __read_mostly;
+++#endif
+++
++ void riscv_fill_hwcap(void)
++ {
++ 	struct device_node *node;
++@@ -40,6 +44,7 @@ void riscv_fill_hwcap(void)
++ 	isa2hwcap['f'] = isa2hwcap['F'] = COMPAT_HWCAP_ISA_F;
++ 	isa2hwcap['d'] = isa2hwcap['D'] = COMPAT_HWCAP_ISA_D;
++ 	isa2hwcap['c'] = isa2hwcap['C'] = COMPAT_HWCAP_ISA_C;
+++	isa2hwcap['z'] = isa2hwcap['Z'] = COMPAT_HWCAP_ISA_Z;
++ 
++ 	elf_hwcap = 0;
++ 
++@@ -75,6 +80,17 @@ void riscv_fill_hwcap(void)
++ 		elf_hwcap &= ~COMPAT_HWCAP_ISA_F;
++ 	}
++ 
+++	//Check for Z extension
+++	#ifdef CONFIG_RISCV_CUSTOM_ENCLAVE
+++	if (elf_hwcap & COMPAT_HWCAP_ISA_Z || true) {
+++		has_enclave = true;
+++		// assume that it works
+++		pr_info("Z extension enabled\n");
+++	} else {
+++		pr_info("No Z extension present\n");
+++	}
+++	#endif
+++
++ 	pr_info("elf_hwcap is 0x%lx\n", elf_hwcap);
++ 
++ #ifdef CONFIG_FPU
++diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
++index 95ca1fe7283c..258b88ccd0ad 100644
++--- a/fs/proc/task_mmu.c
+++++ b/fs/proc/task_mmu.c
++@@ -661,6 +661,18 @@ static void show_smap_vma_flags(struct seq_file *m, struct vm_area_struct *vma)
++ 		[ilog2(VM_PKEY_BIT4)]	= "",
++ #endif
++ #endif /* CONFIG_ARCH_HAS_PKEYS */
+++#if CONFIG_ARCH_HAS_ENCLAVE
+++		[ilog2(VM_ENCLAVE_BIT0)]	= "e0",
+++		[ilog2(VM_ENCLAVE_BIT1)]	= "e1",
+++		[ilog2(VM_ENCLAVE_BIT2)]	= "e2",
+++		[ilog2(VM_ENCLAVE_BIT3)]	= "e3",
+++		[ilog2(VM_ENCLAVE_BIT4)]	= "e4",
+++		[ilog2(VM_ENCLAVE_BIT5)]	= "e5",
+++		[ilog2(VM_ENCLAVE_BIT6)]	= "e6",
+++		[ilog2(VM_ENCLAVE_BIT7)]	= "e7",
+++		[ilog2(VM_ENCLAVE_BIT8)]	= "e8",
+++		[ilog2(VM_ENCLAVE_BIT9)]	= "e9",
+++#endif /* CONFIG_ARCH_HAS_ENCLAVE */
++ 	};
++ 	size_t i;
++ 
++diff --git a/include/linux/mm.h b/include/linux/mm.h
++index 6b10c21630f5..15503a4174fe 100644
++--- a/include/linux/mm.h
+++++ b/include/linux/mm.h
++@@ -252,14 +252,27 @@ extern unsigned int kobjsize(const void *objp);
++ #define VM_HIGH_ARCH_BIT_2	34	/* bit only usable on 64-bit architectures */
++ #define VM_HIGH_ARCH_BIT_3	35	/* bit only usable on 64-bit architectures */
++ #define VM_HIGH_ARCH_BIT_4	36	/* bit only usable on 64-bit architectures */
+++#define VM_HIGH_ARCH_BIT_5	37	/* bit only usable on 64-bit architectures */
+++#define VM_HIGH_ARCH_BIT_6	38	/* bit only usable on 64-bit architectures */
+++#define VM_HIGH_ARCH_BIT_7	39	/* bit only usable on 64-bit architectures */
+++#define VM_HIGH_ARCH_BIT_8	40	/* bit only usable on 64-bit architectures */
+++#define VM_HIGH_ARCH_BIT_9	41	/* bit only usable on 64-bit architectures */
+++#define VM_HIGH_ARCH_BIT_10	42	/* bit only usable on 64-bit architectures */
+++#define VM_HIGH_ARCH_BIT_11	43	/* bit only usable on 64-bit architectures */
++ #define VM_HIGH_ARCH_0	BIT(VM_HIGH_ARCH_BIT_0)
++ #define VM_HIGH_ARCH_1	BIT(VM_HIGH_ARCH_BIT_1)
++ #define VM_HIGH_ARCH_2	BIT(VM_HIGH_ARCH_BIT_2)
++ #define VM_HIGH_ARCH_3	BIT(VM_HIGH_ARCH_BIT_3)
++ #define VM_HIGH_ARCH_4	BIT(VM_HIGH_ARCH_BIT_4)
+++#define VM_HIGH_ARCH_5	BIT(VM_HIGH_ARCH_BIT_5)
+++#define VM_HIGH_ARCH_6	BIT(VM_HIGH_ARCH_BIT_6)
+++#define VM_HIGH_ARCH_7	BIT(VM_HIGH_ARCH_BIT_7)
+++#define VM_HIGH_ARCH_8	BIT(VM_HIGH_ARCH_BIT_8)
+++#define VM_HIGH_ARCH_9	BIT(VM_HIGH_ARCH_BIT_9)
++ #endif /* CONFIG_ARCH_USES_HIGH_VMA_FLAGS */
++ 
++ #ifdef CONFIG_ARCH_HAS_PKEYS
+++//Note: VM_HIGH_ARCH_BIT_0 is an arbitrary (unused) number >= 32 for vm_area_struct->vm_flags (mm_types.h)
++ # define VM_PKEY_SHIFT	VM_HIGH_ARCH_BIT_0
++ # define VM_PKEY_BIT0	VM_HIGH_ARCH_0	/* A protection key is a 4-bit value */
++ # define VM_PKEY_BIT1	VM_HIGH_ARCH_1	/* on x86 and 5-bit value on ppc64   */
++@@ -269,9 +282,45 @@ extern unsigned int kobjsize(const void *objp);
++ # define VM_PKEY_BIT4  VM_HIGH_ARCH_4
++ #else
++ # define VM_PKEY_BIT4  0
+++# define VM_PKEY_BIT5  0
+++# define VM_PKEY_BIT6  0
+++# define VM_PKEY_BIT7  0
+++# define VM_PKEY_BIT8  0
+++# define VM_PKEY_BIT9  0
++ #endif
++ #endif /* CONFIG_ARCH_HAS_PKEYS */
++ 
+++#ifdef CONFIG_ARCH_HAS_ENCLAVE
+++#ifdef CONFIG_ARCH_HAS_PKEYS
+++#error "Cannot have both pkeys and enclaves enabled"
+++#endif
+++
+++# define VM_ENCLAVE_SHIFT VM_HIGH_ARCH_BIT_0
+++# define VM_ENCLAVE_BIT0  VM_HIGH_ARCH_0
+++# define VM_ENCLAVE_BIT1  VM_HIGH_ARCH_1
+++# define VM_ENCLAVE_BIT2  VM_HIGH_ARCH_2
+++# define VM_ENCLAVE_BIT3  VM_HIGH_ARCH_3
+++# define VM_ENCLAVE_BIT4  VM_HIGH_ARCH_4
+++# define VM_ENCLAVE_BIT5  VM_HIGH_ARCH_5
+++# define VM_ENCLAVE_BIT6  VM_HIGH_ARCH_6
+++# define VM_ENCLAVE_BIT7  VM_HIGH_ARCH_7
+++# define VM_ENCLAVE_BIT8  VM_HIGH_ARCH_8
+++# define VM_ENCLAVE_BIT9  VM_HIGH_ARCH_9
+++
+++#define VM_ENCLAVE_MASK ( \
+++	VM_ENCLAVE_BIT0  | \
+++	VM_ENCLAVE_BIT1  | \
+++	VM_ENCLAVE_BIT2  | \
+++	VM_ENCLAVE_BIT3  | \
+++	VM_ENCLAVE_BIT4  | \
+++	VM_ENCLAVE_BIT5  | \
+++	VM_ENCLAVE_BIT6  | \
+++	VM_ENCLAVE_BIT7  | \
+++	VM_ENCLAVE_BIT8  | \
+++	VM_ENCLAVE_BIT9  )
+++
+++#endif
+++
++ #if defined(CONFIG_X86)
++ # define VM_PAT		VM_ARCH_1	/* PAT reserves whole VMA at once (x86) */
++ #elif defined(CONFIG_PPC)
++@@ -329,7 +378,7 @@ extern unsigned int kobjsize(const void *objp);
++ #ifndef VM_ARCH_CLEAR
++ # define VM_ARCH_CLEAR	VM_NONE
++ #endif
++-#define VM_FLAGS_CLEAR	(ARCH_VM_PKEY_FLAGS | VM_ARCH_CLEAR)
+++#define VM_FLAGS_CLEAR	(ARCH_VM_PKEY_FLAGS | VM_ENCLAVE_MASK | VM_ARCH_CLEAR)
++ 
++ /*
++  * mapping from the currently active vm_flags protection bits (the
++diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
++index e446806a561f..d4ade6ff3811 100644
++--- a/include/linux/syscalls.h
+++++ b/include/linux/syscalls.h
++@@ -864,6 +864,7 @@ asmlinkage long sys_swapon(const char __user *specialfile, int swap_flags);
++ asmlinkage long sys_swapoff(const char __user *specialfile);
++ asmlinkage long sys_mprotect(unsigned long start, size_t len,
++ 				unsigned long prot);
+++asmlinkage long sys_riscv_printPTE(unsigned long addr, const char __user * output);
++ asmlinkage long sys_msync(unsigned long start, size_t len, int flags);
++ asmlinkage long sys_mlock(unsigned long start, size_t len);
++ asmlinkage long sys_munlock(unsigned long start, size_t len);
++diff --git a/mm/Kconfig b/mm/Kconfig
++index 25c71eb8a7db..a0e36b8dd364 100644
++--- a/mm/Kconfig
+++++ b/mm/Kconfig
++@@ -737,6 +737,8 @@ config ARCH_USES_HIGH_VMA_FLAGS
++ 	bool
++ config ARCH_HAS_PKEYS
++ 	bool
+++config ARCH_HAS_ENCLAVE
+++	bool
++ 
++ config PERCPU_STATS
++ 	bool "Collect percpu memory statistics"
++diff --git a/mm/mprotect.c b/mm/mprotect.c
++index 028c724dcb1a..dbacdf7da76a 100644
++--- a/mm/mprotect.c
+++++ b/mm/mprotect.c
++@@ -35,6 +35,36 @@
++ 
++ #include "internal.h"
++ 
+++
+++static uint64_t riscv_printPTE(uintptr_t addr){
+++	uint64_t pte = 0;
+++	struct vm_area_struct *vma;
+++	pgprot_t prot;
+++
+++	vma = find_vma(current->mm, addr);
+++	//pr_info("riscv_printPTE: vma address = 0x%lx\n", vma);
+++	if (!vma)
+++		return 0;
+++	//prot = vm_get_page_prot(vma->vm_flags);
+++	prot = vma->vm_page_prot;
+++	pte = pgprot_val(prot);
+++	//TODO actually use PTE. see change_pte_range, change_protection_range
+++	return pte;
+++}
+++SYSCALL_DEFINE2(riscv_printPTE, uintptr_t, addr, const char __user *, output)
+++{
+++	uint64_t pte;
+++	if (addr & ~PAGE_MASK)
+++		return -1;
+++
+++	//*output = debug_pte(addr);
+++	pte = riscv_printPTE(addr);
+++	//pr_info("riscv_printPTE(0x%lx) = 0x%lx\n", addr, pte);
+++	__copy_to_user(output, &pte, sizeof(uint64_t));
+++	//pr_info("copying to 0x%lx\n", output);
+++	return 0;
+++}
+++
++ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
++ 		unsigned long addr, unsigned long end, pgprot_t newprot,
++ 		int dirty_accountable, int prot_numa)
+diff --git a/patches-linux/generate_patch.sh b/patches-linux/generate_patch.sh
+new file mode 100755
+index 0000000..32f5d2d
+--- /dev/null
++++ b/patches-linux/generate_patch.sh
+@@ -0,0 +1,10 @@
++#!/bin/bash
++
++DIRNAME=$(dirname $(readlink -f $0))
++
++# Generate patch files which can be applied via
++# git am *.patch
++echo "Ensure that all changes are committed inside ../buildroot/output/build/linux-ariane-v0.7"
++#git -C ${DIRNAME}/../buildroot/output/build/linux-ariane-v0.7 format-patch -o ${DIRNAME} origin/ariane-v0.7..HEAD
++#git apply *.patch
++git -C ${DIRNAME}/../buildroot/output/build/linux-ariane-v0.7 diff origin/ariane-v0.7..HEAD > ${DIRNAME}/0001-servas.patch
+diff --git a/riscv-fesvr b/riscv-fesvr
+deleted file mode 160000
+index 8d108a0..0000000
+--- a/riscv-fesvr
++++ /dev/null
+@@ -1 +0,0 @@
+-Subproject commit 8d108a0a647901550d95925549337c2c3aec9ac8
+diff --git a/riscv-gnu-toolchain b/riscv-gnu-toolchain
+deleted file mode 160000
+index 45f5db5..0000000
+--- a/riscv-gnu-toolchain
++++ /dev/null
+@@ -1 +0,0 @@
+-Subproject commit 45f5db5a2dc167ef040c70143b94a806912f5771
+diff --git a/riscv-isa-sim b/riscv-isa-sim
+deleted file mode 160000
+index f54ff67..0000000
+--- a/riscv-isa-sim
++++ /dev/null
+@@ -1 +0,0 @@
+-Subproject commit f54ff67b56592a28ce5b5ed729ceb6ad22f7cb8d
+diff --git a/riscv-pk b/riscv-pk
+deleted file mode 160000
+index bfcbacb..0000000
+--- a/riscv-pk
++++ /dev/null
+@@ -1 +0,0 @@
+-Subproject commit bfcbacb13fd9f70fb21a4c129e2be0d5e78be977
+diff --git a/riscv-tests b/riscv-tests
+deleted file mode 160000
+index fbd7e03..0000000
+--- a/riscv-tests
++++ /dev/null
+@@ -1 +0,0 @@
+-Subproject commit fbd7e037ec947c6e9dddc9b78c1cd6bc0fce9993
+diff --git a/rootfs/etc/hostname b/rootfs/etc/hostname
+new file mode 100644
+index 0000000..5621f57
+--- /dev/null
++++ b/rootfs/etc/hostname
+@@ -0,0 +1 @@
++ariane
+diff --git a/rootfs/etc/init.d/S41morefixes b/rootfs/etc/init.d/S41morefixes
+new file mode 100755
+index 0000000..f4eeb36
+--- /dev/null
++++ b/rootfs/etc/init.d/S41morefixes
+@@ -0,0 +1,49 @@
++#!/bin/sh
++#
++# morefixes: fix more stuff
++#
++
++umask 077
++
++start() {
++	echo "Setting date"
++	date +%Y-%m-%d -s "2020-01-01"
++	echo "Setting root password"
++	echo -e 'ariane\nariane\n' | passwd
++
++	echo "Adding lines to /etc/ssh/sshd_config"
++	echo -e '\nPermitRootLogin yes\nMaxAuthTries 10\n' >> /etc/ssh/sshd_config
++
++	#echo "Trying to get eth0 up"
++	#/usr/bin/timeout 2 /sbin/ip link set eth0 up
++	#echo "Trying ifup"
++	#/usr/bin/timeout 2 /sbin/ifup -a
++	#echo "Printing IP info"
++	#ip --color addr
++	echo "Done wtih morefixes!"
++}
++stop() {
++	echo "OK"
++}
++restart() {
++	stop
++	start
++}
++
++case "$1" in
++  start)
++	start
++	;;
++  stop)
++	stop
++	;;
++  restart|reload)
++	restart
++	;;
++  *)
++	echo "Usage: $0 {start|stop|restart}"
++	exit 1
++esac
++
++exit $?
++
+diff --git a/rootfs/etc/init.d/S50sshd b/rootfs/etc/init.d/S50sshd
+new file mode 100755
+index 0000000..134b291
+--- /dev/null
++++ b/rootfs/etc/init.d/S50sshd
+@@ -0,0 +1,61 @@
++#!/bin/sh
++#
++# sshd        Starts sshd.
++#
++
++# Make sure the ssh-keygen progam exists
++[ -f /usr/bin/ssh-keygen ] || exit 0
++
++umask 077
++
++start() {
++	dontstart
++	# start
++}
++dontstart() {
++	echo "Skipping sshd keygen and sshd"
++	echo "Run this command manually if required:"
++	echo "    $0 pleasestart"
++	exit 0
++}
++pleasestart() {
++	# Create any missing keys
++	printf "Generating ssh keys"
++	/usr/bin/ssh-keygen -A
++
++	printf "Starting sshd: "
++	/usr/sbin/sshd
++	touch /var/lock/sshd
++	echo "OK"
++}
++stop() {
++	printf "Stopping sshd: "
++	killall sshd
++	rm -f /var/lock/sshd
++	echo "OK"
++}
++restart() {
++	stop
++	start
++}
++
++case "$1" in
++  start)
++	start
++	;;
++  pleasestart)
++	pleasestart
++	;;
++  stop)
++	stop
++	;;
++  restart|reload)
++	restart
++	;;
++  *)
++	echo "Usage: $0 {start|pleasestart|stop|restart}"
++	exit 1
++esac
++
++exit $?
++
+diff --git a/rootfs/etc/inittab b/rootfs/etc/inittab
+new file mode 100644
+index 0000000..eebda3b
+--- /dev/null
++++ b/rootfs/etc/inittab
+@@ -0,0 +1,63 @@
++# /etc/inittab
++#
++# Copyright (C) 2001 Erik Andersen <andersen@codepoet.org>
++#
++# Note: BusyBox init doesn't support runlevels.  The runlevels field is
++# completely ignored by BusyBox init. If you want runlevels, use
++# sysvinit.
++#
++# Format for each entry: <id>:<runlevels>:<action>:<process>
++#
++# id        == tty to run on, or empty for /dev/console
++# runlevels == ignored
++# action    == one of sysinit, respawn, askfirst, wait, and once
++# process   == program to run
++
++# Startup the system
++::sysinit:/bin/mount -t proc proc /proc
++::sysinit:/bin/mount -o remount,rw /
++::sysinit:/bin/mkdir -p /dev/pts /dev/shm
++::sysinit:/bin/mount -a
++::sysinit:/sbin/swapon -a
++null::sysinit:/bin/ln -sf /proc/self/fd /dev/fd
++null::sysinit:/bin/ln -sf /proc/self/fd/0 /dev/stdin
++null::sysinit:/bin/ln -sf /proc/self/fd/1 /dev/stdout
++null::sysinit:/bin/ln -sf /proc/self/fd/2 /dev/stderr
++::sysinit:/bin/hostname -F /etc/hostname
++
++# now run any rc scripts
++# TODO: rcS somehow destroys our tty's. None of these work:
++# ::respawn
++# ttyS0::respawn
++# console::respawn
++
++#::sysinit:/bin/ls -lah /
++#::sysinit:/bin/ls -lah /dev
++::sysinit:/bin/echo "Running init.d"
++::sysinit:/etc/init.d/rcS
++::sysinit:/bin/echo "Done"
++
++# Put a getty on the serial port
++#::respawn:-/bin/sh # works
++console::respawn:-/bin/sh # works
++
++#console::respawn:/sbin/getty -L  console 0 vt100 # GENERIC_SERIAL
++
++#ttyS0::sysinit:/bin/echo "Welcome on ttyS0"
++#ttyS1::sysinit:/bin/echo "Welcome on ttyS1"
++#ttyS2::sysinit:/bin/echo "Welcome on ttyS2"
++#ttyS3::sysinit:/bin/echo "Welcome on ttyS3"
++#ttyS0::respawn:/sbin/getty -L  ttyS0 0 vt100 # GENERIC_SERIAL
++#ttyS1::respawn:/sbin/getty -L  ttyS1 0 vt100 # GENERIC_SERIAL
++#ttyS2::respawn:/sbin/getty -L  ttyS2 0 vt100 # GENERIC_SERIAL
++#ttyS3::respawn:/sbin/getty -L  ttyS3 0 vt100 # GENERIC_SERIAL
++#ttyS0::respawn:/sbin/getty -L ttyS0 115200 vt100 # GENERIC_SERIAL
++
++
++# Stuff to do for the 3-finger salute
++#::ctrlaltdel:/sbin/reboot
++
++# Stuff to do before rebooting
++::shutdown:/etc/init.d/rcK
++::shutdown:/sbin/swapoff -a
++::shutdown:/bin/umount -a -r
+diff --git a/rootfs/etc/profile b/rootfs/etc/profile
+new file mode 100644
+index 0000000..d658ede
+--- /dev/null
++++ b/rootfs/etc/profile
+@@ -0,0 +1,6 @@
++#ulimit -c unlimited
++echo "Running startup stuff in /etc/profile"
++echo "Trying to mount second partition to mnt"
++mount /dev/mmcblk0p2 /mnt
++
++export TEST_SYSTEM=$(hostname)
+-- 
+2.25.1
+
